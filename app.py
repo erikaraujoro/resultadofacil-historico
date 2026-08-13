@@ -1509,57 +1509,133 @@ def diagnosticar_historico_lotep_20_jbcerto():
 
     for tabela in soup.find_all("table"):
 
-        contexto = ""
+        # ==================================================
+        # PROCURA O TÍTULO DO SORTEIO ANTES DA TABELA
+        # ==================================================
 
-        anterior = tabela.find_previous(
-            ["h1", "h2", "h3", "h4", "strong"]
-        )
+        titulo = ""
 
-        if anterior:
-            contexto = normalizar_texto(
-                anterior.get_text(
-                    " ",
-                    strip=True
+        elemento = tabela.find_previous()
+
+        limite = 0
+
+        while elemento is not None and limite < 40:
+            limite += 1
+
+            try:
+                texto = normalizar_texto(
+                    elemento.get_text(
+                        " ",
+                        strip=True
+                    )
                 )
-            )
+            except Exception:
+                elemento = elemento.find_previous()
+                continue
 
-        contexto_lower = contexto.lower()
+            texto_lower = texto.lower()
 
-        # Queremos exclusivamente LOTEP 20h.
-        if "20" not in contexto_lower:
+            if (
+                "lotep" in texto_lower
+                or "paratodos" in texto_lower
+            ):
+                if re.search(
+                    r"\b20\s*(?:h|horas?)\b",
+                    texto_lower
+                ):
+                    titulo = texto
+                    break
+
+            elemento = elemento.find_previous()
+
+        if not titulo:
             continue
 
-        linhas = tabela.find_all("tr")
+        # ==================================================
+        # PROCURA A DATA ANTERIOR À TABELA
+        # ==================================================
+
+        data_br = ""
+
+        elemento = tabela.find_previous()
+
+        limite = 0
+
+        while elemento is not None and limite < 30:
+            limite += 1
+
+            try:
+                texto = normalizar_texto(
+                    elemento.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+            except Exception:
+                elemento = elemento.find_previous()
+                continue
+
+            match_data = re.search(
+                r"\b(\d{2}/\d{2}/\d{4})\b",
+                texto
+            )
+
+            if match_data:
+                data_br = match_data.group(1)
+                break
+
+            elemento = elemento.find_previous()
+
+        if not data_br:
+            continue
+
+        # ==================================================
+        # EXTRAI M1 ATÉ M5
+        # ==================================================
 
         premios = {}
 
-        for linha in linhas:
+        for linha in tabela.find_all("tr"):
 
-            texto = normalizar_texto(
-                linha.get_text(
+            colunas = linha.find_all(
+                ["td", "th"]
+            )
+
+            if len(colunas) < 2:
+                continue
+
+            premio_txt = normalizar_texto(
+                colunas[0].get_text(
                     " ",
                     strip=True
                 )
             )
 
-            match = re.search(
-                r"\b([1-5])\s*[ºo]?\s*"
-                r"(?:pr[eê]mio)?\D+"
-                r"(\d{1,4})\b",
-                texto,
-                flags=re.IGNORECASE,
+            milhar_txt = normalizar_texto(
+                colunas[1].get_text(
+                    " ",
+                    strip=True
+                )
             )
 
-            if not match:
+            match_premio = re.search(
+                r"([1-5])",
+                premio_txt
+            )
+
+            if not match_premio:
                 continue
 
             posicao = int(
-                match.group(1)
+                match_premio.group(1)
             )
 
-            milhar = match.group(
-                2
-            ).zfill(4)
+            milhar = formatar_milhar(
+                milhar_txt
+            )
+
+            if not milhar:
+                continue
 
             premios[
                 posicao
@@ -1570,44 +1646,6 @@ def diagnosticar_historico_lotep_20_jbcerto():
             for p in range(1, 6)
         ):
             continue
-
-        # Procura uma data no contexto próximo da tabela.
-        bloco_pai = tabela.parent
-
-        texto_proximo = normalizar_texto(
-            bloco_pai.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        match_data = re.search(
-            r"\b(\d{2}/\d{2}/\d{4})\b",
-            texto_proximo
-        )
-
-        if not match_data:
-
-            # Tenta procurar nos elementos anteriores.
-            anterior_data = tabela.find_previous(
-                string=re.compile(
-                    r"\d{2}/\d{2}/\d{4}"
-                )
-            )
-
-            if anterior_data:
-
-                match_data = re.search(
-                    r"\b(\d{2}/\d{2}/\d{4})\b",
-                    str(anterior_data)
-                )
-
-        if not match_data:
-            continue
-
-        data = match_data.group(
-            1
-        )
 
         lista_premios = [
             premios[1],
@@ -1622,7 +1660,7 @@ def diagnosticar_historico_lotep_20_jbcerto():
         )
 
         resultados.append({
-            "data": data,
+            "data": data_br,
             "loteria": "LOTEP",
             "horario": "20",
             "m1": premios[1],
@@ -1632,10 +1670,13 @@ def diagnosticar_historico_lotep_20_jbcerto():
             "m5": premios[5],
             "m6": m6,
             "m7": m7,
-            "titulo": contexto,
+            "titulo": titulo,
         })
 
-    # Remove eventual duplicidade.
+    # ======================================================
+    # REMOVE DUPLICIDADES
+    # ======================================================
+
     unicos = {}
 
     for resultado in resultados:
@@ -1645,61 +1686,30 @@ def diagnosticar_historico_lotep_20_jbcerto():
             resultado["horario"],
         )
 
-        unicos[
-            chave
-        ] = resultado
+        unicos[chave] = resultado
 
     resultados = list(
         unicos.values()
     )
 
-    def chave_ordenacao(item):
-
-        try:
-            return datetime.strptime(
-                item["data"],
-                "%d/%m/%Y"
-            )
-
-        except Exception:
-            return datetime.min
-
     resultados.sort(
-        key=chave_ordenacao
+        key=lambda item: datetime.strptime(
+            item["data"],
+            "%d/%m/%Y"
+        )
     )
-
-    datas_validas = []
-
-    for resultado in resultados:
-
-        try:
-            datas_validas.append(
-                datetime.strptime(
-                    resultado["data"],
-                    "%d/%m/%Y"
-                )
-            )
-
-        except Exception:
-            pass
 
     return {
         "url": URL_JBCERTO_LOTEP,
-        "total": len(
-            resultados
-        ),
+        "total": len(resultados),
         "primeira_data": (
-            min(datas_validas).strftime(
-                "%d/%m/%Y"
-            )
-            if datas_validas
+            resultados[0]["data"]
+            if resultados
             else None
         ),
         "ultima_data": (
-            max(datas_validas).strftime(
-                "%d/%m/%Y"
-            )
-            if datas_validas
+            resultados[-1]["data"]
+            if resultados
             else None
         ),
         "resultados": resultados,
