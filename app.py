@@ -140,6 +140,30 @@ LOTEP20_TOTAL_DIAS = (
     - LOTEP20_DATA_INICIAL.date()
 ).days + 1
 
+
+# ==========================================================
+# COLETA COMPLEMENTAR PT-SP 15H
+# Fonte: Resultado Fácil - banca BANDEIRANTES
+# Período: 01/01/2025 a 11/08/2026
+# ==========================================================
+
+PTSP15_DATA_INICIAL = datetime(2025, 1, 1)
+PTSP15_DATA_FINAL = datetime(2026, 8, 11)
+PTSP15_URL_BASE = "https://www.resultadofacil.com.br/"
+
+ARQUIVO_PTSP15_ESTADO = DIRETORIO_DADOS / "ptsp15_estado.json"
+ARQUIVO_PTSP15_RESULTADOS = DIRETORIO_DADOS / "ptsp15_resultados.jsonl"
+ARQUIVO_PTSP15_AUDITORIA = DIRETORIO_DADOS / "ptsp15_auditoria.jsonl"
+ARQUIVO_PTSP15_EXCEL = DIRETORIO_DADOS / "ptsp_15h_2025_2026.xlsx"
+
+PTSP15_LOCK = threading.Lock()
+PTSP15_THREAD = None
+
+PTSP15_TOTAL_DIAS = (
+    PTSP15_DATA_FINAL.date()
+    - PTSP15_DATA_INICIAL.date()
+).days + 1
+
 COLETA_LOCK = threading.Lock()
 
 COLETA_THREAD = None
@@ -2421,6 +2445,677 @@ def gerar_excel_lotep20():
         "auditoria": len(auditoria),
         "arquivo": str(ARQUIVO_LOTEP20_EXCEL),
     }
+
+
+
+# ==========================================================
+# COLETA HISTÓRICA COMPLEMENTAR - PT-SP 15H
+# BANDEIRANTES 15H -> PT-SP | 15
+# ==========================================================
+
+def ptsp15_estado_inicial():
+    return {
+        "status": "nao_iniciada",
+        "data_inicial": PTSP15_DATA_INICIAL.strftime("%d/%m/%Y"),
+        "data_final": PTSP15_DATA_FINAL.strftime("%d/%m/%Y"),
+        "data_atual": None,
+        "dias_processados": 0,
+        "resultados_coletados": 0,
+        "falhas": 0,
+        "progresso": 0.0,
+        "mensagem": "A coleta PT-SP 15h ainda não foi iniciada.",
+    }
+
+
+def salvar_estado_ptsp15(estado):
+    temporario = ARQUIVO_PTSP15_ESTADO.with_suffix(".tmp")
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(estado, arquivo, ensure_ascii=False, indent=2)
+    os.replace(temporario, ARQUIVO_PTSP15_ESTADO)
+
+
+def carregar_estado_ptsp15():
+    if not ARQUIVO_PTSP15_ESTADO.exists():
+        estado = ptsp15_estado_inicial()
+        salvar_estado_ptsp15(estado)
+        return estado
+
+    try:
+        with open(ARQUIVO_PTSP15_ESTADO, "r", encoding="utf-8") as arquivo:
+            return json.load(arquivo)
+    except Exception:
+        logging.exception("Erro ao carregar estado PT-SP 15h.")
+        return ptsp15_estado_inicial()
+
+
+def carregar_datas_ptsp15_concluidas():
+    concluidas = set()
+
+    if not ARQUIVO_PTSP15_AUDITORIA.exists():
+        return concluidas
+
+    with open(ARQUIVO_PTSP15_AUDITORIA, "r", encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+
+            try:
+                registro = json.loads(linha)
+            except Exception:
+                continue
+
+            if registro.get("status") not in {
+                "ok",
+                "nao_encontrado",
+                "sem_ptsp15",
+            }:
+                continue
+
+            data = registro.get("data", "")
+            if data:
+                concluidas.add(data)
+
+    return concluidas
+
+
+def carregar_chaves_ptsp15():
+    chaves = set()
+
+    if not ARQUIVO_PTSP15_RESULTADOS.exists():
+        return chaves
+
+    with open(ARQUIVO_PTSP15_RESULTADOS, "r", encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+
+            try:
+                registro = json.loads(linha)
+            except Exception:
+                continue
+
+            chaves.add(
+                f"{registro.get('data', '')}|"
+                f"{registro.get('loteria', '')}|"
+                f"{registro.get('horario', '')}"
+            )
+
+    return chaves
+
+
+def montar_url_ptsp15(data_obj):
+    data_iso = data_obj.strftime("%Y-%m-%d")
+
+    return (
+        f"{PTSP15_URL_BASE}"
+        f"resultados-bandeirantes-do-dia-"
+        f"{data_iso}"
+    )
+
+
+def _normalizar_sem_acentos_ptsp15(texto):
+    texto = normalizar_texto(texto).lower()
+
+    trocas = {
+        "á": "a", "à": "a", "ã": "a", "â": "a",
+        "é": "e", "ê": "e", "í": "i",
+        "ó": "o", "ô": "o", "õ": "o",
+        "ú": "u", "ç": "c",
+    }
+
+    for origem, destino in trocas.items():
+        texto = texto.replace(origem, destino)
+
+    return texto
+
+
+def nome_variavel_eh_bandeirantes_15(nome):
+    texto = _normalizar_sem_acentos_ptsp15(nome).upper()
+
+    if "FEDERAL" in texto:
+        return False
+
+    if extrair_horario_variavel(nome) != "15":
+        return False
+
+    return (
+        "BANDEIRANTES" in texto
+        or "BANDEIRANTE" in texto
+        or "SP" in texto
+    )
+
+
+def extrair_ptsp15_resultadofacil(html, data_obj, url):
+    estrutura = extrair_dataset_resultadofacil(html)
+    variaveis = estrutura.get("variaveis", [])
+
+    premios = {}
+    nomes_origem = []
+
+    for item in variaveis:
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
+
+        if not nome or not valor:
+            continue
+
+        if not nome_variavel_eh_bandeirantes_15(nome):
+            continue
+
+        posicao = extrair_posicao_premio(nome)
+        if posicao is None:
+            continue
+
+        milhar = extrair_milhar_valor(valor)
+        if not milhar:
+            continue
+
+        premios[posicao] = milhar
+        nomes_origem.append(nome)
+
+    if not all(p in premios for p in range(1, 6)):
+        return None
+
+    lista = [
+        premios[1],
+        premios[2],
+        premios[3],
+        premios[4],
+        premios[5],
+    ]
+
+    m6, m7 = calcular_premios_6_7(lista)
+
+    return {
+        "data": data_obj.strftime("%d/%m/%Y"),
+        "loteria": "PT-SP",
+        "horario": "15",
+        "m1": premios[1],
+        "m2": premios[2],
+        "m3": premios[3],
+        "m4": premios[4],
+        "m5": premios[5],
+        "m6": m6,
+        "m7": m7,
+        "url": url,
+        "origem": "RESULTADO_FACIL_BANDEIRANTES",
+        "variaveis_origem": nomes_origem,
+    }
+
+
+def buscar_ptsp15_data(data_obj):
+    url = montar_url_ptsp15(data_obj)
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+    except Exception as e:
+        return {
+            "status": "erro_rede",
+            "resultado": None,
+            "url": url,
+            "erro": str(e),
+        }
+
+    if resp.status_code == 404:
+        return {
+            "status": "nao_encontrado",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code == 403:
+        return {
+            "status": "bloqueado_403",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code != 200:
+        return {
+            "status": f"http_{resp.status_code}",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    resultado = extrair_ptsp15_resultadofacil(
+        resp.text,
+        data_obj,
+        url,
+    )
+
+    if resultado is None:
+        return {
+            "status": "sem_ptsp15",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    return {
+        "status": "ok",
+        "resultado": resultado,
+        "url": url,
+        "erro": "",
+    }
+
+
+def executar_coleta_ptsp15():
+    global PTSP15_THREAD
+
+    datas_concluidas = carregar_datas_ptsp15_concluidas()
+    chaves_resultados = carregar_chaves_ptsp15()
+    estado = carregar_estado_ptsp15()
+
+    estado.update({
+        "status": "executando",
+        "data_atual": None,
+        "dias_processados": len(datas_concluidas),
+        "resultados_coletados": len(chaves_resultados),
+        "falhas": 0,
+        "progresso": round(
+            (len(datas_concluidas) / PTSP15_TOTAL_DIAS) * 100,
+            2
+        ),
+        "mensagem": "Coleta histórica PT-SP 15h em andamento.",
+    })
+
+    salvar_estado_ptsp15(estado)
+
+    data_atual = PTSP15_DATA_INICIAL
+
+    try:
+        while data_atual <= PTSP15_DATA_FINAL:
+            data_br = data_atual.strftime("%d/%m/%Y")
+
+            if data_br in datas_concluidas:
+                data_atual += timedelta(days=1)
+                continue
+
+            estado["data_atual"] = data_br
+            estado["mensagem"] = (
+                f"Consultando Bandeirantes 15h em {data_br}."
+            )
+            salvar_estado_ptsp15(estado)
+
+            retorno = buscar_ptsp15_data(data_atual)
+            status = retorno.get("status", "desconhecido")
+            resultado = retorno.get("resultado")
+            novo = 0
+
+            if status == "ok" and resultado:
+                chave = (
+                    f"{resultado['data']}|"
+                    f"{resultado['loteria']}|"
+                    f"{resultado['horario']}"
+                )
+
+                if chave not in chaves_resultados:
+                    adicionar_jsonl(
+                        ARQUIVO_PTSP15_RESULTADOS,
+                        resultado
+                    )
+                    chaves_resultados.add(chave)
+                    novo = 1
+
+            adicionar_jsonl(
+                ARQUIVO_PTSP15_AUDITORIA,
+                {
+                    "data": data_br,
+                    "loteria": "PT-SP",
+                    "horario": "15",
+                    "status": status,
+                    "quantidade": 1 if resultado else 0,
+                    "novos": novo,
+                    "url": retorno.get("url", ""),
+                    "erro": retorno.get("erro", ""),
+                    "processado_em": datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    ),
+                }
+            )
+
+            if status in {
+                "ok",
+                "nao_encontrado",
+                "sem_ptsp15",
+            }:
+                datas_concluidas.add(data_br)
+            else:
+                estado["falhas"] += 1
+
+            estado["dias_processados"] = len(datas_concluidas)
+            estado["resultados_coletados"] = len(chaves_resultados)
+            estado["progresso"] = round(
+                (len(datas_concluidas) / PTSP15_TOTAL_DIAS) * 100,
+                2
+            )
+
+            salvar_estado_ptsp15(estado)
+
+            time.sleep(0.8)
+            data_atual += timedelta(days=1)
+
+        estado.update({
+            "status": "concluida",
+            "data_atual": PTSP15_DATA_FINAL.strftime("%d/%m/%Y"),
+            "dias_processados": len(datas_concluidas),
+            "resultados_coletados": len(chaves_resultados),
+            "progresso": round(
+                (len(datas_concluidas) / PTSP15_TOTAL_DIAS) * 100,
+                2
+            ),
+            "mensagem": "Coleta histórica PT-SP 15h concluída.",
+        })
+
+        salvar_estado_ptsp15(estado)
+
+    except Exception as e:
+        logging.exception("Falha geral na coleta PT-SP 15h.")
+        estado.update({
+            "status": "erro",
+            "mensagem": str(e),
+        })
+        salvar_estado_ptsp15(estado)
+
+    finally:
+        with PTSP15_LOCK:
+            PTSP15_THREAD = None
+
+
+def gerar_excel_ptsp15():
+    resultados = carregar_jsonl(ARQUIVO_PTSP15_RESULTADOS)
+    auditoria = carregar_jsonl(ARQUIVO_PTSP15_AUDITORIA)
+
+    if not resultados:
+        raise ValueError(
+            "Nenhum resultado PT-SP 15h foi coletado."
+        )
+
+    resultados.sort(
+        key=lambda item: datetime.strptime(
+            item.get("data", "01/01/1900"),
+            "%d/%m/%Y"
+        )
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "PT-SP 15H"
+
+    ws.append([
+        "Data", "Loteria", "Horário",
+        "M1", "M2", "M3", "M4", "M5", "M6", "M7",
+        "Origem", "URL",
+    ])
+
+    for resultado in resultados:
+        ws.append([
+            resultado.get("data", ""),
+            resultado.get("loteria", "PT-SP"),
+            resultado.get("horario", "15"),
+            resultado.get("m1", ""),
+            resultado.get("m2", ""),
+            resultado.get("m3", ""),
+            resultado.get("m4", ""),
+            resultado.get("m5", ""),
+            resultado.get("m6", ""),
+            resultado.get("m7", ""),
+            resultado.get("origem", ""),
+            resultado.get("url", ""),
+        ])
+
+    for linha in range(2, ws.max_row + 1):
+        ws.cell(linha, 3).number_format = "@"
+
+        for coluna in range(4, 10):
+            celula = ws.cell(linha, coluna)
+            celula.value = str(celula.value).zfill(4)
+            celula.number_format = "@"
+
+        celula_m7 = ws.cell(linha, 10)
+        celula_m7.value = str(celula_m7.value).zfill(3)
+        celula_m7.number_format = "@"
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:L{ws.max_row}"
+
+    for col, largura in {
+        "A": 13, "B": 12, "C": 10,
+        "D": 9, "E": 9, "F": 9, "G": 9, "H": 9, "I": 9, "J": 9,
+        "K": 30, "L": 85,
+    }.items():
+        ws.column_dimensions[col].width = largura
+
+    ws_auditoria = wb.create_sheet("AUDITORIA")
+    ws_auditoria.append([
+        "Data", "Loteria", "Horário", "Status",
+        "Quantidade", "Novos", "URL", "Erro", "Processado em",
+    ])
+
+    for registro in auditoria:
+        ws_auditoria.append([
+            registro.get("data", ""),
+            registro.get("loteria", "PT-SP"),
+            registro.get("horario", "15"),
+            registro.get("status", ""),
+            registro.get("quantidade", 0),
+            registro.get("novos", 0),
+            registro.get("url", ""),
+            registro.get("erro", ""),
+            registro.get("processado_em", ""),
+        ])
+
+    wb.save(ARQUIVO_PTSP15_EXCEL)
+
+    return {
+        "resultados": len(resultados),
+        "auditoria": len(auditoria),
+        "arquivo": str(ARQUIVO_PTSP15_EXCEL),
+    }
+
+
+# ==========================================================
+# ROTAS PT-SP 15H
+# ==========================================================
+
+@app.route("/ptsp15/teste/<data_teste>")
+def teste_ptsp15(data_teste):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    retorno = buscar_ptsp15_data(data_obj)
+
+    return jsonify({
+        "ok": True,
+        "data_consulta": data_teste,
+        **retorno,
+    })
+
+
+@app.route("/ptsp15/debug/<data_teste>")
+def debug_ptsp15(data_teste):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    url = montar_url_ptsp15(data_obj)
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    estrutura = extrair_dataset_resultadofacil(
+        resp.text
+    )
+
+    candidatos = []
+
+    for item in estrutura.get("variaveis", []):
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
+        horario = extrair_horario_variavel(nome)
+        texto = _normalizar_sem_acentos_ptsp15(nome).upper()
+
+        if (
+            horario != "15"
+            and "BANDEIR" not in texto
+            and "FEDERAL" not in texto
+        ):
+            continue
+
+        candidatos.append({
+            "nome": nome,
+            "valor": valor,
+            "horario": horario,
+            "posicao": extrair_posicao_premio(nome),
+            "federal": "FEDERAL" in texto,
+            "aceito_ptsp15": nome_variavel_eh_bandeirantes_15(nome),
+        })
+
+    return jsonify({
+        "ok": True,
+        "status_http": resp.status_code,
+        "url": url,
+        "total_variaveis_dataset": len(
+            estrutura.get("variaveis", [])
+        ),
+        "candidatos": candidatos,
+    })
+
+
+@app.route("/ptsp15/status")
+def status_ptsp15():
+    estado = carregar_estado_ptsp15()
+
+    return jsonify({
+        "ok": True,
+        "disco": str(DIRETORIO_DADOS),
+        "total_dias_previstos": PTSP15_TOTAL_DIAS,
+        "estado": estado,
+        "arquivos": {
+            "estado": ARQUIVO_PTSP15_ESTADO.exists(),
+            "resultados": ARQUIVO_PTSP15_RESULTADOS.exists(),
+            "auditoria": ARQUIVO_PTSP15_AUDITORIA.exists(),
+            "excel": ARQUIVO_PTSP15_EXCEL.exists(),
+        },
+    })
+
+
+@app.route("/ptsp15/iniciar")
+def iniciar_ptsp15():
+    global PTSP15_THREAD
+
+    with PTSP15_LOCK:
+        if (
+            PTSP15_THREAD is not None
+            and PTSP15_THREAD.is_alive()
+        ):
+            return jsonify({
+                "ok": False,
+                "mensagem": "A coleta PT-SP 15h já está em execução.",
+                "estado": carregar_estado_ptsp15(),
+            }), 409
+
+        PTSP15_THREAD = threading.Thread(
+            target=executar_coleta_ptsp15,
+            name="coleta_ptsp15",
+            daemon=True,
+        )
+        PTSP15_THREAD.start()
+
+    return jsonify({
+        "ok": True,
+        "mensagem": "Coleta histórica PT-SP 15h iniciada.",
+        "periodo": {
+            "inicio": PTSP15_DATA_INICIAL.strftime("%d/%m/%Y"),
+            "fim": PTSP15_DATA_FINAL.strftime("%d/%m/%Y"),
+        },
+        "total_dias": PTSP15_TOTAL_DIAS,
+        "status_url": "/ptsp15/status",
+    })
+
+
+@app.route("/ptsp15/gerar-excel")
+def rota_gerar_excel_ptsp15():
+    estado = carregar_estado_ptsp15()
+
+    if estado.get("status") != "concluida":
+        return jsonify({
+            "ok": False,
+            "mensagem": "A coleta PT-SP 15h ainda não foi concluída.",
+            "estado": estado,
+        }), 409
+
+    try:
+        resumo = gerar_excel_ptsp15()
+
+        return jsonify({
+            "ok": True,
+            "mensagem": "Planilha PT-SP 15h gerada com sucesso.",
+            **resumo,
+            "download": "/ptsp15/baixar",
+        })
+
+    except Exception as e:
+        logging.exception(
+            "Erro ao gerar Excel PT-SP 15h."
+        )
+
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
+
+
+@app.route("/ptsp15/baixar")
+def baixar_excel_ptsp15():
+    if not ARQUIVO_PTSP15_EXCEL.exists():
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A planilha PT-SP 15h ainda não foi gerada. "
+                "Acesse /ptsp15/gerar-excel primeiro."
+            ),
+        }), 404
+
+    return send_file(
+        ARQUIVO_PTSP15_EXCEL,
+        as_attachment=True,
+        download_name=(
+            "ptsp_15h_01-01-2025_a_11-08-2026.xlsx"
+        ),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
 
 
 # ==========================================================
