@@ -118,14 +118,14 @@ ARQUIVO_EXCEL = (
 
 # ==========================================================
 # COLETA COMPLEMENTAR LOTEP 20H
-# Fonte: Loteria Nacional
+# Fonte: jogodobicho.inf.br
 # Período: 01/01/2025 a 12/08/2026
 # ==========================================================
 
 LOTEP20_DATA_INICIAL = datetime(2025, 1, 1)
 LOTEP20_DATA_FINAL = datetime(2026, 8, 12)
 
-LOTEP20_URL_BASE = "https://www.loterianacional.com.br/"
+LOTEP20_URL_BASE = "https://jogodobicho.inf.br/"
 
 ARQUIVO_LOTEP20_ESTADO = DIRETORIO_DADOS / "lotep20_estado.json"
 ARQUIVO_LOTEP20_RESULTADOS = DIRETORIO_DADOS / "lotep20_resultados.jsonl"
@@ -1885,12 +1885,17 @@ def nome_dia_semana_lotep20(data_obj):
 
 
 def montar_url_lotep20(data_obj):
+    """
+    Exemplo:
+    02/07/2025 ->
+    resultado-jogo-do-bicho-da-paraiba-de-quarta-feira-02072025/
+    """
     dia_semana = nome_dia_semana_lotep20(data_obj)
-    data_url = data_obj.strftime("%d%m%y")
+    data_url = data_obj.strftime("%d%m%Y")
 
     return (
         f"{LOTEP20_URL_BASE}"
-        f"resultado-da-lotep-de-"
+        f"resultado-jogo-do-bicho-da-paraiba-de-"
         f"{dia_semana}-"
         f"{data_url}/"
     )
@@ -1986,111 +1991,90 @@ def _extrair_premios_de_tabela_lotep20(tabela):
     ]
 
 
-def extrair_lotep20_loterianacional(html, data_obj, url):
-    soup = BeautifulSoup(html, "html.parser")
+def extrair_lotep20_jogodobicho(html, data_obj, url):
+    """
+    Extrai exclusivamente o bloco:
+    Paraíba PARATODOS 20 horas.
 
-    # Estratégia 1: encontra o marcador "Paraíba PARATODOS 20 horas"
-    # e usa a primeira tabela realmente próxima dele.
-    candidatos = soup.find_all(
-        ["h1", "h2", "h3", "h4", "h5", "strong", "p", "div"]
+    A página possui vários sorteios no mesmo dia. O parser ancora
+    no bloco das 20h para não misturar Federal ou LOTEP 18h.
+    """
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
     )
 
-    for marcador in candidatos:
-        texto_marcador = normalizar_texto(
-            marcador.get_text(" ", strip=True)
+    texto_pagina = normalizar_texto(
+        soup.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    texto_sem_acentos = (
+        _normalizar_sem_acentos_lotep20(
+            texto_pagina
+        )
+    )
+
+    marcador = re.search(
+        r"paraiba\s+paratodos\s+20\s+horas",
+        texto_sem_acentos,
+        flags=re.IGNORECASE,
+    )
+
+    if not marcador:
+        return None
+
+    trecho = texto_sem_acentos[
+        marcador.start():
+        marcador.start() + 2500
+    ]
+
+    premios = {}
+
+    for posicao in range(1, 6):
+        match = re.search(
+            rf"\b{posicao}\s*[ºoa]?\s+(\d{{1,4}})\b",
+            trecho,
+            flags=re.IGNORECASE,
         )
 
-        if not _texto_tem_lotep20(texto_marcador):
-            continue
+        if not match:
+            return None
 
-        tabela = marcador.find_next("table")
+        premios[posicao] = match.group(
+            1
+        ).zfill(4)
 
-        if tabela is None:
-            continue
+    lista = [
+        premios[1],
+        premios[2],
+        premios[3],
+        premios[4],
+        premios[5],
+    ]
 
-        elemento = marcador.find_next()
-        passos = 0
+    m6, m7 = calcular_premios_6_7(
+        lista
+    )
 
-        while (
-            elemento is not None
-            and elemento is not tabela
-            and passos < 35
-        ):
-            passos += 1
-            elemento = elemento.find_next()
-
-        if elemento is not tabela:
-            continue
-
-        premios = _extrair_premios_de_tabela_lotep20(tabela)
-
-        if len(premios) == 5:
-            m6, m7 = calcular_premios_6_7(premios)
-
-            return {
-                "data": data_obj.strftime("%d/%m/%Y"),
-                "loteria": "LOTEP",
-                "horario": "20",
-                "m1": premios[0],
-                "m2": premios[1],
-                "m3": premios[2],
-                "m4": premios[3],
-                "m5": premios[4],
-                "m6": m6,
-                "m7": m7,
-                "url": url,
-                "origem": "LOTERIA_NACIONAL",
-            }
-
-    # Estratégia 2: percorre tabelas e confere o contexto anterior.
-    for tabela in soup.find_all("table"):
-        elemento = tabela.find_previous()
-        contexto_ok = False
-        limite = 0
-
-        while elemento is not None and limite < 25:
-            limite += 1
-
-            try:
-                texto = normalizar_texto(
-                    elemento.get_text(" ", strip=True)
-                )
-            except Exception:
-                elemento = elemento.find_previous()
-                continue
-
-            if _texto_tem_lotep20(texto):
-                contexto_ok = True
-                break
-
-            elemento = elemento.find_previous()
-
-        if not contexto_ok:
-            continue
-
-        premios = _extrair_premios_de_tabela_lotep20(tabela)
-
-        if len(premios) != 5:
-            continue
-
-        m6, m7 = calcular_premios_6_7(premios)
-
-        return {
-            "data": data_obj.strftime("%d/%m/%Y"),
-            "loteria": "LOTEP",
-            "horario": "20",
-            "m1": premios[0],
-            "m2": premios[1],
-            "m3": premios[2],
-            "m4": premios[3],
-            "m5": premios[4],
-            "m6": m6,
-            "m7": m7,
-            "url": url,
-            "origem": "LOTERIA_NACIONAL",
-        }
-
-    return None
+    return {
+        "data": data_obj.strftime(
+            "%d/%m/%Y"
+        ),
+        "loteria": "LOTEP",
+        "horario": "20",
+        "m1": premios[1],
+        "m2": premios[2],
+        "m3": premios[3],
+        "m4": premios[4],
+        "m5": premios[5],
+        "m6": m6,
+        "m7": m7,
+        "url": url,
+        "origem": "JOGODOBICHO_INF_BR",
+    }
 
 
 def buscar_lotep20_data(data_obj):
@@ -2135,7 +2119,7 @@ def buscar_lotep20_data(data_obj):
             "erro": "",
         }
 
-    resultado = extrair_lotep20_loterianacional(
+    resultado = extrair_lotep20_jogodobicho(
         resp.text,
         data_obj,
         url,
