@@ -1175,7 +1175,308 @@ def diagnosticar_pagina_resultadofacil(loteria, data_obj):
     }
     
 
+def carregar_jsonl(caminho):
+    registros = []
 
+    if not caminho.exists():
+        return registros
+
+    with open(
+        caminho,
+        "r",
+        encoding="utf-8"
+    ) as arquivo:
+
+        for linha in arquivo:
+            linha = linha.strip()
+
+            if not linha:
+                continue
+
+            try:
+                registro = json.loads(
+                    linha
+                )
+
+                registros.append(
+                    registro
+                )
+
+            except Exception:
+                logging.exception(
+                    "Linha inválida em %s",
+                    caminho
+                )
+
+    return registros
+
+def gerar_excel_historico():
+    resultados = carregar_jsonl(
+        ARQUIVO_RESULTADOS
+    )
+
+    auditoria = carregar_jsonl(
+        ARQUIVO_AUDITORIA
+    )
+
+    if not resultados:
+        raise ValueError(
+            "Nenhum resultado coletado foi encontrado."
+        )
+
+    # ======================================================
+    # ORDENAÇÃO DOS RESULTADOS
+    # ======================================================
+
+    ordem_loterias = {
+        "PT-SP": 1,
+        "LOTEP": 2,
+        "PT-BA": 3,
+        "LOTECE": 4,
+    }
+
+    def chave_resultado(item):
+        try:
+            data = datetime.strptime(
+                item.get("data", ""),
+                "%d/%m/%Y"
+            )
+        except Exception:
+            data = datetime.max
+
+        horario = str(
+            item.get(
+                "horario",
+                ""
+            )
+        ).zfill(2)
+
+        return (
+            data,
+            ordem_loterias.get(
+                item.get("loteria", ""),
+                999
+            ),
+            horario,
+        )
+
+    resultados.sort(
+        key=chave_resultado
+    )
+
+    # ======================================================
+    # ORDENAÇÃO DA AUDITORIA
+    # ======================================================
+
+    def chave_auditoria(item):
+        try:
+            data = datetime.strptime(
+                item.get("data", ""),
+                "%d/%m/%Y"
+            )
+        except Exception:
+            data = datetime.max
+
+        return (
+            data,
+            ordem_loterias.get(
+                item.get("loteria", ""),
+                999
+            ),
+        )
+
+    auditoria.sort(
+        key=chave_auditoria
+    )
+
+    # ======================================================
+    # CRIA WORKBOOK
+    # ======================================================
+
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "RESULTADOS"
+
+    cabecalho_resultados = [
+        "Data",
+        "Loteria",
+        "Horário",
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M7",
+    ]
+
+    ws.append(
+        cabecalho_resultados
+    )
+
+    for resultado in resultados:
+
+        ws.append([
+            resultado.get("data", ""),
+            resultado.get("loteria", ""),
+            resultado.get("horario", ""),
+            resultado.get("m1", ""),
+            resultado.get("m2", ""),
+            resultado.get("m3", ""),
+            resultado.get("m4", ""),
+            resultado.get("m5", ""),
+            resultado.get("m6", ""),
+            resultado.get("m7", ""),
+        ])
+
+    # ======================================================
+    # PRESERVA ZEROS À ESQUERDA
+    # ======================================================
+
+    for linha in range(
+        2,
+        ws.max_row + 1
+    ):
+
+        # Horário
+        ws.cell(
+            linha,
+            3
+        ).number_format = "@"
+
+        # M1 até M6 = 4 caracteres
+        for coluna in range(
+            4,
+            10
+        ):
+            celula = ws.cell(
+                linha,
+                coluna
+            )
+
+            celula.value = str(
+                celula.value
+            ).zfill(4)
+
+            celula.number_format = "@"
+
+        # M7 = 3 caracteres
+        celula_m7 = ws.cell(
+            linha,
+            10
+        )
+
+        celula_m7.value = str(
+            celula_m7.value
+        ).zfill(3)
+
+        celula_m7.number_format = "@"
+
+    # ======================================================
+    # AUDITORIA
+    # ======================================================
+
+    ws_auditoria = wb.create_sheet(
+        "AUDITORIA"
+    )
+
+    ws_auditoria.append([
+        "Data",
+        "Loteria",
+        "Status",
+        "Quantidade",
+        "Novos",
+        "URL",
+        "Erro",
+        "Processado em",
+    ])
+
+    for registro in auditoria:
+
+        ws_auditoria.append([
+            registro.get("data", ""),
+            registro.get("loteria", ""),
+            registro.get("status", ""),
+            registro.get("quantidade", 0),
+            registro.get("novos", 0),
+            registro.get("url", ""),
+            registro.get("erro", ""),
+            registro.get("processado_em", ""),
+        ])
+
+    # ======================================================
+    # AJUSTES VISUAIS
+    # ======================================================
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = (
+        f"A1:J{ws.max_row}"
+    )
+
+    larguras_resultados = {
+        "A": 13,
+        "B": 13,
+        "C": 10,
+        "D": 9,
+        "E": 9,
+        "F": 9,
+        "G": 9,
+        "H": 9,
+        "I": 9,
+        "J": 9,
+    }
+
+    for coluna, largura in (
+        larguras_resultados.items()
+    ):
+        ws.column_dimensions[
+            coluna
+        ].width = largura
+
+    ws_auditoria.freeze_panes = "A2"
+
+    ws_auditoria.auto_filter.ref = (
+        f"A1:H{ws_auditoria.max_row}"
+    )
+
+    larguras_auditoria = {
+        "A": 13,
+        "B": 13,
+        "C": 24,
+        "D": 13,
+        "E": 10,
+        "F": 75,
+        "G": 40,
+        "H": 22,
+    }
+
+    for coluna, largura in (
+        larguras_auditoria.items()
+    ):
+        ws_auditoria.column_dimensions[
+            coluna
+        ].width = largura
+
+    # ======================================================
+    # SALVA NO PERSISTENT DISK
+    # ======================================================
+
+    wb.save(
+        ARQUIVO_EXCEL
+    )
+
+    return {
+        "resultados": len(
+            resultados
+        ),
+        "auditoria": len(
+            auditoria
+        ),
+        "arquivo": str(
+            ARQUIVO_EXCEL
+        ),
+    }
 
 # ==========================================================
 # ROTAS DE TESTE
@@ -1247,6 +1548,73 @@ def iniciar_coleta():
             "/coleta/status"
         ),
     })
+    
+@app.route("/coleta/gerar-excel")
+def rota_gerar_excel():
+
+    estado = carregar_estado_coleta()
+
+    if estado.get(
+        "status"
+    ) != "concluida":
+
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A coleta histórica ainda não "
+                "foi concluída."
+            ),
+            "estado": estado,
+        }), 409
+
+    try:
+        resumo = gerar_excel_historico()
+
+        return jsonify({
+            "ok": True,
+            "mensagem": (
+                "Planilha gerada com sucesso."
+            ),
+            **resumo,
+            "download": "/coleta/baixar",
+        })
+
+    except Exception as e:
+
+        logging.exception(
+            "Erro ao gerar Excel histórico."
+        )
+
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
+        
+@app.route("/coleta/baixar")
+def baixar_excel():
+
+    if not ARQUIVO_EXCEL.exists():
+
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A planilha ainda não foi gerada. "
+                "Acesse /coleta/gerar-excel primeiro."
+            ),
+        }), 404
+
+    return send_file(
+        ARQUIVO_EXCEL,
+        as_attachment=True,
+        download_name=(
+            "resultadofacil_"
+            "01-01-2025_a_12-08-2026.xlsx"
+        ),
+        mimetype=(
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
+        ),
+    )
 
 @app.route("/")
 def home():
