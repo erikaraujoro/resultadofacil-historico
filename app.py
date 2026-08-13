@@ -130,7 +130,7 @@ LOTEP20_URL_BASE = "https://www.resultadofacil.com.br/"
 ARQUIVO_LOTEP20_ESTADO = DIRETORIO_DADOS / "lotep20_estado.json"
 ARQUIVO_LOTEP20_RESULTADOS = DIRETORIO_DADOS / "lotep20_resultados.jsonl"
 ARQUIVO_LOTEP20_AUDITORIA = DIRETORIO_DADOS / "lotep20_auditoria.jsonl"
-ARQUIVO_LOTEP20_EXCEL = DIRETORIO_DADOS / "lotep20_2025_2026.xlsx"
+ARQUIVO_LOTEP20_EXCEL = DIRETORIO_DADOS / "lotep_09_20_2025_2026.xlsx"
 
 LOTEP20_LOCK = threading.Lock()
 LOTEP20_THREAD = None
@@ -1886,17 +1886,17 @@ def nome_dia_semana_lotep20(data_obj):
 
 def montar_url_lotep20(data_obj):
     """
-    Monta a mesma URL histórica da LOTEP usada na coleta principal.
+    Página histórica da PARATODOS PB.
 
     Exemplo:
-    01/08/2025 ->
-    https://www.resultadofacil.com.br/resultados-lotep-do-dia-2025-08-01
+    12/08/2026 ->
+    https://www.resultadofacil.com.br/resultados-paratodos-pb-do-dia-2026-08-12
     """
     data_iso = data_obj.strftime("%Y-%m-%d")
 
     return (
         f"{LOTEP20_URL_BASE}"
-        f"resultados-lotep-do-dia-"
+        f"resultados-paratodos-pb-do-dia-"
         f"{data_iso}"
     )
 
@@ -1991,165 +1991,104 @@ def _extrair_premios_de_tabela_lotep20(tabela):
     ]
 
 
-def nome_variavel_eh_lotep20_resultadofacil(nome):
-    texto = _normalizar_sem_acentos_lotep20(
-        nome
-    ).upper()
+def nome_variavel_eh_paratodos_pb(nome):
+    texto = _normalizar_sem_acentos_lotep20(nome).upper()
 
-    # Federal é publicada misturada em algumas páginas.
     if "FEDERAL" in texto:
         return False
 
-    horario = extrair_horario_variavel(
-        nome
-    )
-
-    if horario != "20":
-        return False
-
-    # Formas encontradas/esperadas para o sorteio complementar:
-    # PARATODOS PB
-    # PARA TODOS PB
-    # PARATODOS PARAIBA
-    # PARA TODOS PARAIBA
-    # Algumas páginas também podem manter LOTEP no mesmo nome.
-    tem_paratodos = (
+    return (
         "PARATODOS" in texto
         or "PARA TODOS" in texto
-    )
-
-    tem_paraiba = (
-        " PB " in f" {texto} "
-        or texto.endswith(" PB")
+        or " PB " in f" {texto} "
         or "PARAIBA" in texto
     )
 
-    # Segurança adicional: se vier explicitamente como LOTEP 20h,
-    # também aceitamos, desde que não seja Federal.
-    tem_lotep_20 = (
-        "LOTEP" in texto
-        and horario == "20"
-    )
 
-    return (
-        (tem_paratodos and tem_paraiba)
-        or tem_lotep_20
-    )
-
-
-def extrair_lotep20_resultadofacil(
-    html,
-    data_obj,
-    url
-):
+def extrair_paratodos_pb_resultadofacil(html, data_obj, url):
     """
-    Extrai exclusivamente o resultado da Paraíba/PARATODOS 20h
-    a partir do Dataset JSON-LD do Resultado Fácil.
-
-    O parser da coleta principal já comprovou que esse Dataset
-    é acessível pelo Render; o diferencial aqui é aceitar a
-    nomenclatura PARATODOS/PB que não passava pelo filtro LOTEP.
+    Extrai os sorteios 09h/09:45 e 20h da PARATODOS PB
+    e normaliza ambos para a loteria LOTEP do LoteriasDB.
     """
-    estrutura = extrair_dataset_resultadofacil(
-        html
-    )
+    estrutura = extrair_dataset_resultadofacil(html)
+    variaveis = estrutura.get("variaveis", [])
 
-    variaveis = estrutura.get(
-        "variaveis",
-        []
-    )
+    sorteios = {
+        "09": {},
+        "20": {},
+    }
 
-    premios = {}
-    nomes_encontrados = []
+    nomes_origem = {
+        "09": [],
+        "20": [],
+    }
 
     for item in variaveis:
-        if not isinstance(
-            item,
-            dict
-        ):
+        if not isinstance(item, dict):
             continue
 
-        nome = obter_campo_item(
-            item,
-            [
-                "name",
-                "nome",
-            ]
-        )
-
-        valor = obter_campo_item(
-            item,
-            [
-                "value",
-                "valor",
-            ]
-        )
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
 
         if not nome or not valor:
             continue
 
-        if not nome_variavel_eh_lotep20_resultadofacil(
-            nome
-        ):
+        if not nome_variavel_eh_paratodos_pb(nome):
             continue
 
-        posicao = extrair_posicao_premio(
-            nome
-        )
+        horario = extrair_horario_variavel(nome)
+
+        if horario not in {"09", "20"}:
+            continue
+
+        posicao = extrair_posicao_premio(nome)
 
         if posicao is None:
             continue
 
-        milhar = extrair_milhar_valor(
-            valor
-        )
+        milhar = extrair_milhar_valor(valor)
 
         if not milhar:
             continue
 
-        premios[
-            posicao
-        ] = milhar
+        sorteios[horario][posicao] = milhar
+        nomes_origem[horario].append(nome)
 
-        nomes_encontrados.append(
-            nome
-        )
+    resultados = []
 
-    if not all(
-        p in premios
-        for p in range(1, 6)
-    ):
-        return None
+    for horario in ["09", "20"]:
+        premios = sorteios[horario]
 
-    lista = [
-        premios[1],
-        premios[2],
-        premios[3],
-        premios[4],
-        premios[5],
-    ]
+        if not all(p in premios for p in range(1, 6)):
+            continue
 
-    m6, m7 = calcular_premios_6_7(
-        lista
-    )
+        lista = [
+            premios[1],
+            premios[2],
+            premios[3],
+            premios[4],
+            premios[5],
+        ]
 
-    return {
-        "data": data_obj.strftime(
-            "%d/%m/%Y"
-        ),
-        "loteria": "LOTEP",
-        "horario": "20",
-        "m1": premios[1],
-        "m2": premios[2],
-        "m3": premios[3],
-        "m4": premios[4],
-        "m5": premios[5],
-        "m6": m6,
-        "m7": m7,
-        "url": url,
-        "origem": "RESULTADO_FACIL_PARATODOS_PB",
-        "variaveis_origem": nomes_encontrados,
-    }
+        m6, m7 = calcular_premios_6_7(lista)
+
+        resultados.append({
+            "data": data_obj.strftime("%d/%m/%Y"),
+            "loteria": "LOTEP",
+            "horario": horario,
+            "m1": premios[1],
+            "m2": premios[2],
+            "m3": premios[3],
+            "m4": premios[4],
+            "m5": premios[5],
+            "m6": m6,
+            "m7": m7,
+            "url": url,
+            "origem": "RESULTADO_FACIL_PARATODOS_PB",
+            "variaveis_origem": nomes_origem[horario],
+        })
+
+    return resultados
 
 
 def buscar_lotep20_data(data_obj):
@@ -2161,11 +2100,10 @@ def buscar_lotep20_data(data_obj):
             headers=HEADERS,
             timeout=30,
         )
-
     except Exception as e:
         return {
             "status": "erro_rede",
-            "resultado": None,
+            "resultados": [],
             "url": url,
             "erro": str(e),
         }
@@ -2173,7 +2111,7 @@ def buscar_lotep20_data(data_obj):
     if resp.status_code == 404:
         return {
             "status": "nao_encontrado",
-            "resultado": None,
+            "resultados": [],
             "url": url,
             "erro": "",
         }
@@ -2181,7 +2119,7 @@ def buscar_lotep20_data(data_obj):
     if resp.status_code == 403:
         return {
             "status": "bloqueado_403",
-            "resultado": None,
+            "resultados": [],
             "url": url,
             "erro": "",
         }
@@ -2189,28 +2127,28 @@ def buscar_lotep20_data(data_obj):
     if resp.status_code != 200:
         return {
             "status": f"http_{resp.status_code}",
-            "resultado": None,
+            "resultados": [],
             "url": url,
             "erro": "",
         }
 
-    resultado = extrair_lotep20_resultadofacil(
+    resultados = extrair_paratodos_pb_resultadofacil(
         resp.text,
         data_obj,
         url,
     )
 
-    if resultado is None:
+    if not resultados:
         return {
-            "status": "sem_lotep20",
-            "resultado": None,
+            "status": "sem_paratodos_pb",
+            "resultados": [],
             "url": url,
             "erro": "",
         }
 
     return {
         "status": "ok",
-        "resultado": resultado,
+        "resultados": resultados,
         "url": url,
         "erro": "",
     }
@@ -2220,7 +2158,7 @@ def executar_coleta_lotep20():
     global LOTEP20_THREAD
 
     logging.info(
-        "Iniciando coleta histórica complementar LOTEP 20h."
+        "Iniciando coleta histórica PARATODOS PB 09h/20h -> LOTEP."
     )
 
     datas_concluidas = carregar_datas_lotep20_concluidas()
@@ -2237,7 +2175,7 @@ def executar_coleta_lotep20():
             (len(datas_concluidas) / LOTEP20_TOTAL_DIAS) * 100,
             2
         ),
-        "mensagem": "Coleta histórica LOTEP 20h em andamento.",
+        "mensagem": "Coleta histórica PARATODOS PB 09h/20h em andamento.",
     })
 
     salvar_estado_lotep20(estado)
@@ -2253,41 +2191,42 @@ def executar_coleta_lotep20():
                 continue
 
             estado["data_atual"] = data_br
-            estado["mensagem"] = (
-                f"Consultando LOTEP 20h em {data_br}."
-            )
+            estado["mensagem"] = f"Consultando PARATODOS PB em {data_br}."
             salvar_estado_lotep20(estado)
 
             retorno = buscar_lotep20_data(data_atual)
-
             status = retorno.get("status", "desconhecido")
-            resultado = retorno.get("resultado")
-            novo = 0
+            resultados = retorno.get("resultados", [])
+            novos = 0
 
-            if status == "ok" and resultado:
-                chave = (
-                    f"{resultado['data']}|"
-                    f"{resultado['loteria']}|"
-                    f"{resultado['horario']}"
-                )
+            if status == "ok":
+                for resultado in resultados:
+                    chave = (
+                        f"{resultado['data']}|"
+                        f"{resultado['loteria']}|"
+                        f"{resultado['horario']}"
+                    )
 
-                if chave not in chaves_resultados:
+                    if chave in chaves_resultados:
+                        continue
+
                     adicionar_jsonl(
                         ARQUIVO_LOTEP20_RESULTADOS,
                         resultado
                     )
+
                     chaves_resultados.add(chave)
-                    novo = 1
+                    novos += 1
 
             adicionar_jsonl(
                 ARQUIVO_LOTEP20_AUDITORIA,
                 {
                     "data": data_br,
                     "loteria": "LOTEP",
-                    "horario": "20",
+                    "horarios": [r.get("horario") for r in resultados],
                     "status": status,
-                    "quantidade": 1 if resultado else 0,
-                    "novos": novo,
+                    "quantidade": len(resultados),
+                    "novos": novos,
                     "url": retorno.get("url", ""),
                     "erro": retorno.get("erro", ""),
                     "processado_em": datetime.now().strftime(
@@ -2299,7 +2238,7 @@ def executar_coleta_lotep20():
             if status in {
                 "ok",
                 "nao_encontrado",
-                "sem_lotep20",
+                "sem_paratodos_pb",
             }:
                 datas_concluidas.add(data_br)
             else:
@@ -2326,13 +2265,15 @@ def executar_coleta_lotep20():
                 (len(datas_concluidas) / LOTEP20_TOTAL_DIAS) * 100,
                 2
             ),
-            "mensagem": "Coleta histórica LOTEP 20h concluída.",
+            "mensagem": "Coleta histórica PARATODOS PB 09h/20h concluída.",
         })
 
         salvar_estado_lotep20(estado)
 
     except Exception as e:
-        logging.exception("Falha geral na coleta LOTEP 20h.")
+        logging.exception(
+            "Falha geral na coleta PARATODOS PB 09h/20h."
+        )
 
         estado.update({
             "status": "erro",
@@ -2352,7 +2293,7 @@ def gerar_excel_lotep20():
 
     if not resultados:
         raise ValueError(
-            "Nenhum resultado LOTEP 20h foi coletado."
+            "Nenhum resultado PARATODOS PB 09h/20h foi coletado."
         )
 
     resultados.sort(
@@ -2365,7 +2306,7 @@ def gerar_excel_lotep20():
     wb = Workbook()
 
     ws = wb.active
-    ws.title = "LOTEP 20H"
+    ws.title = "LOTEP 09H E 20H"
 
     ws.append([
         "Data",
@@ -2572,7 +2513,7 @@ def debug_lotep20_resultadofacil(
                 nome
             ),
             "aceito_lotep20": (
-                nome_variavel_eh_lotep20_resultadofacil(
+                nome_variavel_eh_paratodos_pb(
                     nome
                 )
             ),
@@ -2857,7 +2798,7 @@ def iniciar_lotep20():
             return jsonify({
                 "ok": False,
                 "mensagem": (
-                    "A coleta LOTEP 20h já está em execução."
+                    "A coleta PARATODOS PB 09h/20h já está em execução."
                 ),
                 "estado": carregar_estado_lotep20(),
             }), 409
@@ -2873,7 +2814,7 @@ def iniciar_lotep20():
     return jsonify({
         "ok": True,
         "mensagem": (
-            "Coleta histórica LOTEP 20h iniciada."
+            "Coleta histórica PARATODOS PB 09h/20h iniciada."
         ),
         "periodo": {
             "inicio": LOTEP20_DATA_INICIAL.strftime("%d/%m/%Y"),
@@ -2892,7 +2833,7 @@ def rota_gerar_excel_lotep20():
         return jsonify({
             "ok": False,
             "mensagem": (
-                "A coleta LOTEP 20h ainda não foi concluída."
+                "A coleta PARATODOS PB 09h/20h ainda não foi concluída."
             ),
             "estado": estado,
         }), 409
@@ -2903,7 +2844,7 @@ def rota_gerar_excel_lotep20():
         return jsonify({
             "ok": True,
             "mensagem": (
-                "Planilha LOTEP 20h gerada com sucesso."
+                "Planilha LOTEP 09h/20h gerada com sucesso."
             ),
             **resumo,
             "download": "/lotep20/baixar",
@@ -2924,7 +2865,7 @@ def baixar_excel_lotep20():
         return jsonify({
             "ok": False,
             "mensagem": (
-                "A planilha LOTEP 20h ainda não foi gerada. "
+                "A planilha LOTEP 09h/20h ainda não foi gerada. "
                 "Acesse /lotep20/gerar-excel primeiro."
             ),
         }), 404
@@ -2933,7 +2874,7 @@ def baixar_excel_lotep20():
         ARQUIVO_LOTEP20_EXCEL,
         as_attachment=True,
         download_name=(
-            "lotep20_01-01-2025_a_12-08-2026.xlsx"
+            "lotep_09h_20h_01-01-2025_a_12-08-2026.xlsx"
         ),
         mimetype=(
             "application/vnd.openxmlformats-officedocument."
