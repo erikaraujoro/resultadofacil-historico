@@ -2592,6 +2592,215 @@ def debug_lotep20_resultadofacil(
     })
 
 
+
+# ==========================================================
+# DEBUG HTML LOTEP 20H - NÃO GRAVA NADA
+# Procura termos relacionados ao sorteio das 20h no HTML bruto
+# e devolve pequenos trechos ao redor de cada ocorrência.
+# ==========================================================
+
+@app.route("/lotep20/debug-html/<data_teste>")
+def debug_html_lotep20(
+    data_teste
+):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    url = montar_url_lotep20(
+        data_obj
+    )
+
+    try:
+        resp = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+        )
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+            "url": url,
+        }), 500
+
+    html = resp.text or ""
+
+    termos = [
+        "PARATODOS",
+        "PARA TODOS",
+        "20 horas",
+        "20h",
+        "Paraíba",
+        "Paraiba",
+        "PB",
+    ]
+
+    ocorrencias = []
+
+    html_lower = html.lower()
+
+    for termo in termos:
+        termo_lower = termo.lower()
+
+        inicio_busca = 0
+
+        while True:
+            pos = html_lower.find(
+                termo_lower,
+                inicio_busca
+            )
+
+            if pos == -1:
+                break
+
+            inicio = max(
+                0,
+                pos - 500
+            )
+
+            fim = min(
+                len(html),
+                pos + len(termo) + 1200
+            )
+
+            trecho = html[
+                inicio:fim
+            ]
+
+            ocorrencias.append({
+                "termo": termo,
+                "posicao": pos,
+                "trecho": trecho,
+            })
+
+            inicio_busca = (
+                pos + len(termo_lower)
+            )
+
+            # Evita resposta gigantesca em páginas com muitas repetições.
+            if sum(
+                1
+                for item in ocorrencias
+                if item["termo"] == termo
+            ) >= 10:
+                break
+
+    # Remove trechos quase duplicados por posição próxima.
+    filtradas = []
+    posicoes_usadas = []
+
+    for item in sorted(
+        ocorrencias,
+        key=lambda x: x["posicao"]
+    ):
+        if any(
+            abs(
+                item["posicao"] - existente
+            ) < 250
+            for existente in posicoes_usadas
+        ):
+            continue
+
+        filtradas.append(
+            item
+        )
+
+        posicoes_usadas.append(
+            item["posicao"]
+        )
+
+    # Extrai também o texto visível da página para uma segunda checagem.
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
+    texto_visivel = normalizar_texto(
+        soup.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    texto_visivel_lower = (
+        texto_visivel.lower()
+    )
+
+    trechos_texto_visivel = []
+
+    for termo in termos:
+        termo_lower = termo.lower()
+
+        inicio_busca = 0
+
+        while True:
+            pos = texto_visivel_lower.find(
+                termo_lower,
+                inicio_busca
+            )
+
+            if pos == -1:
+                break
+
+            inicio = max(
+                0,
+                pos - 300
+            )
+
+            fim = min(
+                len(texto_visivel),
+                pos + len(termo) + 900
+            )
+
+            trechos_texto_visivel.append({
+                "termo": termo,
+                "posicao": pos,
+                "trecho": texto_visivel[
+                    inicio:fim
+                ],
+            })
+
+            inicio_busca = (
+                pos + len(termo_lower)
+            )
+
+            if sum(
+                1
+                for item in trechos_texto_visivel
+                if item["termo"] == termo
+            ) >= 10:
+                break
+
+    return jsonify({
+        "ok": True,
+        "status_http": resp.status_code,
+        "url": url,
+        "tamanho_html": len(
+            html
+        ),
+        "total_ocorrencias_html": len(
+            filtradas
+        ),
+        "ocorrencias_html": filtradas,
+        "total_ocorrencias_texto": len(
+            trechos_texto_visivel
+        ),
+        "ocorrencias_texto": (
+            trechos_texto_visivel
+        ),
+    })
+
+
 # ==========================================================
 # ROTAS LOTEP 20H
 # ==========================================================
