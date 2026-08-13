@@ -118,14 +118,14 @@ ARQUIVO_EXCEL = (
 
 # ==========================================================
 # COLETA COMPLEMENTAR LOTEP 20H
-# Fonte: jogodobicho.inf.br
+# Fonte: Resultado Fácil - bloco PARATODOS/PB 20h
 # Período: 01/01/2025 a 12/08/2026
 # ==========================================================
 
 LOTEP20_DATA_INICIAL = datetime(2025, 1, 1)
 LOTEP20_DATA_FINAL = datetime(2026, 8, 12)
 
-LOTEP20_URL_BASE = "https://jogodobicho.inf.br/"
+LOTEP20_URL_BASE = "https://www.resultadofacil.com.br/"
 
 ARQUIVO_LOTEP20_ESTADO = DIRETORIO_DADOS / "lotep20_estado.json"
 ARQUIVO_LOTEP20_RESULTADOS = DIRETORIO_DADOS / "lotep20_resultados.jsonl"
@@ -1886,18 +1886,18 @@ def nome_dia_semana_lotep20(data_obj):
 
 def montar_url_lotep20(data_obj):
     """
+    Monta a mesma URL histórica da LOTEP usada na coleta principal.
+
     Exemplo:
-    02/07/2025 ->
-    resultado-jogo-do-bicho-da-paraiba-de-quarta-feira-02072025/
+    01/08/2025 ->
+    https://www.resultadofacil.com.br/resultados-lotep-do-dia-2025-08-01
     """
-    dia_semana = nome_dia_semana_lotep20(data_obj)
-    data_url = data_obj.strftime("%d%m%Y")
+    data_iso = data_obj.strftime("%Y-%m-%d")
 
     return (
         f"{LOTEP20_URL_BASE}"
-        f"resultado-jogo-do-bicho-da-paraiba-de-"
-        f"{dia_semana}-"
-        f"{data_url}/"
+        f"resultados-lotep-do-dia-"
+        f"{data_iso}"
     )
 
 
@@ -1991,61 +1991,135 @@ def _extrair_premios_de_tabela_lotep20(tabela):
     ]
 
 
-def extrair_lotep20_jogodobicho(html, data_obj, url):
+def nome_variavel_eh_lotep20_resultadofacil(nome):
+    texto = _normalizar_sem_acentos_lotep20(
+        nome
+    ).upper()
+
+    # Federal é publicada misturada em algumas páginas.
+    if "FEDERAL" in texto:
+        return False
+
+    horario = extrair_horario_variavel(
+        nome
+    )
+
+    if horario != "20":
+        return False
+
+    # Formas encontradas/esperadas para o sorteio complementar:
+    # PARATODOS PB
+    # PARA TODOS PB
+    # PARATODOS PARAIBA
+    # PARA TODOS PARAIBA
+    # Algumas páginas também podem manter LOTEP no mesmo nome.
+    tem_paratodos = (
+        "PARATODOS" in texto
+        or "PARA TODOS" in texto
+    )
+
+    tem_paraiba = (
+        " PB " in f" {texto} "
+        or texto.endswith(" PB")
+        or "PARAIBA" in texto
+    )
+
+    # Segurança adicional: se vier explicitamente como LOTEP 20h,
+    # também aceitamos, desde que não seja Federal.
+    tem_lotep_20 = (
+        "LOTEP" in texto
+        and horario == "20"
+    )
+
+    return (
+        (tem_paratodos and tem_paraiba)
+        or tem_lotep_20
+    )
+
+
+def extrair_lotep20_resultadofacil(
+    html,
+    data_obj,
+    url
+):
     """
-    Extrai exclusivamente o bloco:
-    Paraíba PARATODOS 20 horas.
+    Extrai exclusivamente o resultado da Paraíba/PARATODOS 20h
+    a partir do Dataset JSON-LD do Resultado Fácil.
 
-    A página possui vários sorteios no mesmo dia. O parser ancora
-    no bloco das 20h para não misturar Federal ou LOTEP 18h.
+    O parser da coleta principal já comprovou que esse Dataset
+    é acessível pelo Render; o diferencial aqui é aceitar a
+    nomenclatura PARATODOS/PB que não passava pelo filtro LOTEP.
     """
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
+    estrutura = extrair_dataset_resultadofacil(
+        html
     )
 
-    texto_pagina = normalizar_texto(
-        soup.get_text(
-            " ",
-            strip=True
-        )
+    variaveis = estrutura.get(
+        "variaveis",
+        []
     )
-
-    texto_sem_acentos = (
-        _normalizar_sem_acentos_lotep20(
-            texto_pagina
-        )
-    )
-
-    marcador = re.search(
-        r"paraiba\s+paratodos\s+20\s+horas",
-        texto_sem_acentos,
-        flags=re.IGNORECASE,
-    )
-
-    if not marcador:
-        return None
-
-    trecho = texto_sem_acentos[
-        marcador.start():
-        marcador.start() + 2500
-    ]
 
     premios = {}
+    nomes_encontrados = []
 
-    for posicao in range(1, 6):
-        match = re.search(
-            rf"\b{posicao}\s*[ºoa]?\s+(\d{{1,4}})\b",
-            trecho,
-            flags=re.IGNORECASE,
+    for item in variaveis:
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+        nome = obter_campo_item(
+            item,
+            [
+                "name",
+                "nome",
+            ]
         )
 
-        if not match:
-            return None
+        valor = obter_campo_item(
+            item,
+            [
+                "value",
+                "valor",
+            ]
+        )
 
-        premios[posicao] = match.group(
-            1
-        ).zfill(4)
+        if not nome or not valor:
+            continue
+
+        if not nome_variavel_eh_lotep20_resultadofacil(
+            nome
+        ):
+            continue
+
+        posicao = extrair_posicao_premio(
+            nome
+        )
+
+        if posicao is None:
+            continue
+
+        milhar = extrair_milhar_valor(
+            valor
+        )
+
+        if not milhar:
+            continue
+
+        premios[
+            posicao
+        ] = milhar
+
+        nomes_encontrados.append(
+            nome
+        )
+
+    if not all(
+        p in premios
+        for p in range(1, 6)
+    ):
+        return None
 
     lista = [
         premios[1],
@@ -2073,7 +2147,8 @@ def extrair_lotep20_jogodobicho(html, data_obj, url):
         "m6": m6,
         "m7": m7,
         "url": url,
-        "origem": "JOGODOBICHO_INF_BR",
+        "origem": "RESULTADO_FACIL_PARATODOS_PB",
+        "variaveis_origem": nomes_encontrados,
     }
 
 
@@ -2119,7 +2194,7 @@ def buscar_lotep20_data(data_obj):
             "erro": "",
         }
 
-    resultado = extrair_lotep20_jogodobicho(
+    resultado = extrair_lotep20_resultadofacil(
         resp.text,
         data_obj,
         url,
@@ -2405,6 +2480,116 @@ def gerar_excel_lotep20():
         "auditoria": len(auditoria),
         "arquivo": str(ARQUIVO_LOTEP20_EXCEL),
     }
+
+
+# ==========================================================
+# DEBUG JSON-LD LOTEP 20H - NÃO GRAVA NADA
+# ==========================================================
+
+@app.route("/lotep20/debug/<data_teste>")
+def debug_lotep20_resultadofacil(
+    data_teste
+):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    url = montar_url_lotep20(
+        data_obj
+    )
+
+    try:
+        resp = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+        )
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+            "url": url,
+        }), 500
+
+    estrutura = extrair_dataset_resultadofacil(
+        resp.text
+    )
+
+    saida = []
+
+    for item in estrutura.get(
+        "variaveis",
+        []
+    ):
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+        nome = obter_campo_item(
+            item,
+            ["name", "nome"]
+        )
+
+        valor = obter_campo_item(
+            item,
+            ["value", "valor"]
+        )
+
+        texto = _normalizar_sem_acentos_lotep20(
+            nome
+        ).upper()
+
+        # Mostra somente candidatos ligados a LOTEP,
+        # Paraíba, PB, PARATODOS ou horário 20.
+        if (
+            "LOTEP" not in texto
+            and "PARATODOS" not in texto
+            and "PARA TODOS" not in texto
+            and "PARAIBA" not in texto
+            and " PB " not in f" {texto} "
+            and extrair_horario_variavel(nome) != "20"
+        ):
+            continue
+
+        saida.append({
+            "nome": nome,
+            "valor": valor,
+            "horario": extrair_horario_variavel(
+                nome
+            ),
+            "posicao": extrair_posicao_premio(
+                nome
+            ),
+            "aceito_lotep20": (
+                nome_variavel_eh_lotep20_resultadofacil(
+                    nome
+                )
+            ),
+        })
+
+    return jsonify({
+        "ok": True,
+        "status_http": resp.status_code,
+        "url": url,
+        "total_variaveis_dataset": len(
+            estrutura.get(
+                "variaveis",
+                []
+            )
+        ),
+        "candidatos": saida,
+    })
 
 
 # ==========================================================
