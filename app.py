@@ -23,7 +23,7 @@ logging.basicConfig(
 # CONFIGURAÇÕES
 # ==========================================================
 
-LOTerias = {
+LOTTERIAS = {
     "PT-SP": {
         "slug": "resultados-pt-sp-do-dia-",
         "url_base": "https://www.resultadofacil.com.br/",
