@@ -109,6 +109,18 @@ ARQUIVO_EXCEL = (
 
 COLETA_LOCK = threading.Lock()
 
+COLETA_THREAD = None
+
+TOTAL_DIAS_COLETA = (
+    DATA_FINAL_COLETA.date()
+    - DATA_INICIAL_COLETA.date()
+).days + 1
+
+TOTAL_PAGINAS_COLETA = (
+    TOTAL_DIAS_COLETA
+    * len(LOTERIAS)
+)
+
 def estado_inicial_coleta():
     return {
         "status": "nao_iniciada",
@@ -195,6 +207,424 @@ def adicionar_jsonl(
             )
         )
         arquivo.write("\n")
+        
+def carregar_chaves_resultados():
+    chaves = set()
+
+    if not ARQUIVO_RESULTADOS.exists():
+        return chaves
+
+    try:
+        with open(
+            ARQUIVO_RESULTADOS,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(
+                        linha
+                    )
+                except Exception:
+                    continue
+
+                chave = (
+                    f"{registro.get('data', '')}|"
+                    f"{registro.get('loteria', '')}|"
+                    f"{registro.get('horario', '')}"
+                )
+
+                chaves.add(
+                    chave
+                )
+
+    except Exception:
+        logging.exception(
+            "Erro ao carregar chaves dos resultados."
+        )
+
+    return chaves
+
+
+def carregar_paginas_concluidas():
+    """
+    Retorna as páginas já processadas com sucesso.
+
+    Uma página é identificada por:
+    DATA + LOTERIA
+
+    Falhas HTTP/rede não entram aqui,
+    pois deverão ser tentadas novamente.
+    """
+
+    concluidas = set()
+
+    if not ARQUIVO_AUDITORIA.exists():
+        return concluidas
+
+    try:
+        with open(
+            ARQUIVO_AUDITORIA,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(
+                        linha
+                    )
+                except Exception:
+                    continue
+
+                status = registro.get(
+                    "status",
+                    ""
+                )
+
+                if status not in {
+                    "ok",
+                    "nao_encontrado",
+                    "sem_resultados_validos",
+                }:
+                    continue
+
+                chave = (
+                    f"{registro.get('data', '')}|"
+                    f"{registro.get('loteria', '')}"
+                )
+
+                concluidas.add(
+                    chave
+                )
+
+    except Exception:
+        logging.exception(
+            "Erro ao carregar auditoria."
+        )
+
+    return concluidas
+
+def executar_coleta_historica():
+    global COLETA_THREAD
+
+    logging.info(
+        "Iniciando coleta histórica Resultado Fácil."
+    )
+
+    chaves_resultados = (
+        carregar_chaves_resultados()
+    )
+
+    paginas_concluidas = (
+        carregar_paginas_concluidas()
+    )
+
+    estado = carregar_estado_coleta()
+
+    estado.update({
+        "status": "executando",
+        "data_atual": None,
+        "loteria_atual": None,
+        "paginas_processadas": len(
+            paginas_concluidas
+        ),
+        "resultados_coletados": len(
+            chaves_resultados
+        ),
+        "falhas": 0,
+        "progresso": round(
+            (
+                len(paginas_concluidas)
+                / TOTAL_PAGINAS_COLETA
+            ) * 100,
+            2
+        ),
+        "mensagem": (
+            "Coleta histórica em andamento."
+        ),
+    })
+
+    salvar_estado_coleta(
+        estado
+    )
+
+    data_atual = (
+        DATA_INICIAL_COLETA
+    )
+
+    try:
+        while (
+            data_atual
+            <= DATA_FINAL_COLETA
+        ):
+
+            data_br = data_atual.strftime(
+                "%d/%m/%Y"
+            )
+
+            for loteria in LOTERIAS.keys():
+
+                chave_pagina = (
+                    f"{data_br}|{loteria}"
+                )
+
+                # Página já processada anteriormente
+                if (
+                    chave_pagina
+                    in paginas_concluidas
+                ):
+                    continue
+
+                estado[
+                    "data_atual"
+                ] = data_br
+
+                estado[
+                    "loteria_atual"
+                ] = loteria
+
+                estado[
+                    "mensagem"
+                ] = (
+                    f"Consultando "
+                    f"{loteria} em "
+                    f"{data_br}."
+                )
+
+                salvar_estado_coleta(
+                    estado
+                )
+
+                logging.info(
+                    "Consultando %s | %s",
+                    data_br,
+                    loteria,
+                )
+
+                try:
+                    retorno = (
+                        buscar_resultados_data(
+                            loteria,
+                            data_atual
+                        )
+                    )
+
+                    status = retorno.get(
+                        "status",
+                        "desconhecido"
+                    )
+
+                    resultados = retorno.get(
+                        "resultados",
+                        []
+                    )
+
+                    quantidade_novos = 0
+
+                    if status == "ok":
+
+                        for resultado in resultados:
+
+                            chave_resultado = (
+                                f"{resultado['data']}|"
+                                f"{resultado['loteria']}|"
+                                f"{resultado['horario']}"
+                            )
+
+                            if (
+                                chave_resultado
+                                in chaves_resultados
+                            ):
+                                continue
+
+                            adicionar_jsonl(
+                                ARQUIVO_RESULTADOS,
+                                resultado
+                            )
+
+                            chaves_resultados.add(
+                                chave_resultado
+                            )
+
+                            quantidade_novos += 1
+
+                    registro_auditoria = {
+                        "data": data_br,
+                        "loteria": loteria,
+                        "status": status,
+                        "quantidade": len(
+                            resultados
+                        ),
+                        "novos": quantidade_novos,
+                        "url": retorno.get(
+                            "url",
+                            ""
+                        ),
+                        "erro": retorno.get(
+                            "erro",
+                            ""
+                        ),
+                        "processado_em": datetime.now().strftime(
+                            "%d/%m/%Y %H:%M:%S"
+                        ),
+                    }
+
+                    adicionar_jsonl(
+                        ARQUIVO_AUDITORIA,
+                        registro_auditoria
+                    )
+
+                    # Só marca como concluída
+                    # se não houve erro de rede/HTTP.
+                    if status in {
+                        "ok",
+                        "nao_encontrado",
+                        "sem_resultados_validos",
+                    }:
+                        paginas_concluidas.add(
+                            chave_pagina
+                        )
+
+                    else:
+                        estado["falhas"] += 1
+
+                except Exception as e:
+
+                    logging.exception(
+                        "Erro durante coleta %s | %s",
+                        data_br,
+                        loteria,
+                    )
+
+                    estado[
+                        "falhas"
+                    ] += 1
+
+                    adicionar_jsonl(
+                        ARQUIVO_AUDITORIA,
+                        {
+                            "data": data_br,
+                            "loteria": loteria,
+                            "status": "erro_interno",
+                            "quantidade": 0,
+                            "novos": 0,
+                            "url": montar_url(
+                                loteria,
+                                data_atual
+                            ),
+                            "erro": str(e),
+                            "processado_em": datetime.now().strftime(
+                                "%d/%m/%Y %H:%M:%S"
+                            ),
+                        }
+                    )
+
+                estado[
+                    "paginas_processadas"
+                ] = len(
+                    paginas_concluidas
+                )
+
+                estado[
+                    "resultados_coletados"
+                ] = len(
+                    chaves_resultados
+                )
+
+                estado[
+                    "progresso"
+                ] = round(
+                    (
+                        len(
+                            paginas_concluidas
+                        )
+                        / TOTAL_PAGINAS_COLETA
+                    ) * 100,
+                    2
+                )
+
+                salvar_estado_coleta(
+                    estado
+                )
+
+                # Pequena pausa para não bombardear
+                # o Resultado Fácil.
+                time.sleep(0.8)
+
+            data_atual += timedelta(
+                days=1
+            )
+
+        estado.update({
+            "status": "concluida",
+            "data_atual": DATA_FINAL_COLETA.strftime(
+                "%d/%m/%Y"
+            ),
+            "loteria_atual": None,
+            "paginas_processadas": len(
+                paginas_concluidas
+            ),
+            "resultados_coletados": len(
+                chaves_resultados
+            ),
+            "progresso": round(
+                (
+                    len(
+                        paginas_concluidas
+                    )
+                    / TOTAL_PAGINAS_COLETA
+                ) * 100,
+                2
+            ),
+            "mensagem": (
+                "Coleta histórica concluída."
+            ),
+        })
+
+        salvar_estado_coleta(
+            estado
+        )
+
+        logging.info(
+            "Coleta histórica concluída. "
+            "Resultados: %s | "
+            "Páginas: %s | "
+            "Falhas: %s",
+            len(chaves_resultados),
+            len(paginas_concluidas),
+            estado["falhas"],
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "Falha geral na coleta histórica."
+        )
+
+        estado.update({
+            "status": "erro",
+            "mensagem": str(e),
+        })
+
+        salvar_estado_coleta(
+            estado
+        )
+
+    finally:
+        with COLETA_LOCK:
+            COLETA_THREAD = None
 
 
 # ==========================================================
@@ -760,6 +1190,9 @@ def status_coleta():
         "disco": str(
             DIRETORIO_DADOS
         ),
+        "total_paginas_previstas": (
+            TOTAL_PAGINAS_COLETA
+        ),
         "estado": estado,
         "arquivos": {
             "estado": ARQUIVO_ESTADO.exists(),
@@ -767,6 +1200,52 @@ def status_coleta():
             "auditoria": ARQUIVO_AUDITORIA.exists(),
             "excel": ARQUIVO_EXCEL.exists(),
         },
+    })
+    
+@app.route("/coleta/iniciar")
+def iniciar_coleta():
+    global COLETA_THREAD
+
+    with COLETA_LOCK:
+
+        if (
+            COLETA_THREAD is not None
+            and COLETA_THREAD.is_alive()
+        ):
+            return jsonify({
+                "ok": False,
+                "mensagem": (
+                    "A coleta já está em execução."
+                ),
+                "estado": carregar_estado_coleta(),
+            }), 409
+
+        COLETA_THREAD = threading.Thread(
+            target=executar_coleta_historica,
+            name="coleta_resultadofacil",
+            daemon=True,
+        )
+
+        COLETA_THREAD.start()
+
+    return jsonify({
+        "ok": True,
+        "mensagem": (
+            "Coleta histórica iniciada."
+        ),
+        "periodo": {
+            "inicio": "01/01/2025",
+            "fim": "12/08/2026",
+        },
+        "loterias": list(
+            LOTERIAS.keys()
+        ),
+        "total_paginas": (
+            TOTAL_PAGINAS_COLETA
+        ),
+        "status_url": (
+            "/coleta/status"
+        ),
     })
 
 @app.route("/")
