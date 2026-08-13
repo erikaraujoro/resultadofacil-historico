@@ -115,6 +115,31 @@ ARQUIVO_EXCEL = (
     / "resultadofacil_2025_2026.xlsx"
 )
 
+
+# ==========================================================
+# COLETA COMPLEMENTAR LOTEP 20H
+# Fonte: Loteria Nacional
+# Período: 01/01/2025 a 12/08/2026
+# ==========================================================
+
+LOTEP20_DATA_INICIAL = datetime(2025, 1, 1)
+LOTEP20_DATA_FINAL = datetime(2026, 8, 12)
+
+LOTEP20_URL_BASE = "https://www.loterianacional.com.br/"
+
+ARQUIVO_LOTEP20_ESTADO = DIRETORIO_DADOS / "lotep20_estado.json"
+ARQUIVO_LOTEP20_RESULTADOS = DIRETORIO_DADOS / "lotep20_resultados.jsonl"
+ARQUIVO_LOTEP20_AUDITORIA = DIRETORIO_DADOS / "lotep20_auditoria.jsonl"
+ARQUIVO_LOTEP20_EXCEL = DIRETORIO_DADOS / "lotep20_2025_2026.xlsx"
+
+LOTEP20_LOCK = threading.Lock()
+LOTEP20_THREAD = None
+
+LOTEP20_TOTAL_DIAS = (
+    LOTEP20_DATA_FINAL.date()
+    - LOTEP20_DATA_INICIAL.date()
+).days + 1
+
 COLETA_LOCK = threading.Lock()
 
 COLETA_THREAD = None
@@ -1714,6 +1739,830 @@ def diagnosticar_historico_lotep_20_jbcerto():
         ),
         "resultados": resultados,
     }
+
+
+# ==========================================================
+# COLETA HISTÓRICA COMPLEMENTAR - LOTEP 20H
+# ==========================================================
+
+def lotep20_estado_inicial():
+    return {
+        "status": "nao_iniciada",
+        "data_inicial": LOTEP20_DATA_INICIAL.strftime("%d/%m/%Y"),
+        "data_final": LOTEP20_DATA_FINAL.strftime("%d/%m/%Y"),
+        "data_atual": None,
+        "dias_processados": 0,
+        "resultados_coletados": 0,
+        "falhas": 0,
+        "progresso": 0.0,
+        "mensagem": "A coleta LOTEP 20h ainda não foi iniciada.",
+    }
+
+
+def salvar_estado_lotep20(estado):
+    temporario = ARQUIVO_LOTEP20_ESTADO.with_suffix(".tmp")
+
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(
+            estado,
+            arquivo,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(temporario, ARQUIVO_LOTEP20_ESTADO)
+
+
+def carregar_estado_lotep20():
+    if not ARQUIVO_LOTEP20_ESTADO.exists():
+        estado = lotep20_estado_inicial()
+        salvar_estado_lotep20(estado)
+        return estado
+
+    try:
+        with open(
+            ARQUIVO_LOTEP20_ESTADO,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            return json.load(arquivo)
+
+    except Exception:
+        logging.exception("Erro ao carregar estado LOTEP 20h.")
+        return lotep20_estado_inicial()
+
+
+def carregar_datas_lotep20_concluidas():
+    concluidas = set()
+
+    if not ARQUIVO_LOTEP20_AUDITORIA.exists():
+        return concluidas
+
+    try:
+        with open(
+            ARQUIVO_LOTEP20_AUDITORIA,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(linha)
+                except Exception:
+                    continue
+
+                if registro.get("status") not in {
+                    "ok",
+                    "nao_encontrado",
+                    "sem_lotep20",
+                }:
+                    continue
+
+                data = registro.get("data", "")
+
+                if data:
+                    concluidas.add(data)
+
+    except Exception:
+        logging.exception("Erro ao carregar auditoria LOTEP 20h.")
+
+    return concluidas
+
+
+def carregar_chaves_lotep20():
+    chaves = set()
+
+    if not ARQUIVO_LOTEP20_RESULTADOS.exists():
+        return chaves
+
+    try:
+        with open(
+            ARQUIVO_LOTEP20_RESULTADOS,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(linha)
+                except Exception:
+                    continue
+
+                chave = (
+                    f"{registro.get('data', '')}|"
+                    f"{registro.get('loteria', '')}|"
+                    f"{registro.get('horario', '')}"
+                )
+
+                chaves.add(chave)
+
+    except Exception:
+        logging.exception("Erro ao carregar resultados LOTEP 20h.")
+
+    return chaves
+
+
+def nome_dia_semana_lotep20(data_obj):
+    nomes = {
+        0: "segunda-feira",
+        1: "terca-feira",
+        2: "quarta-feira",
+        3: "quinta-feira",
+        4: "sexta-feira",
+        5: "sabado",
+        6: "domingo",
+    }
+
+    return nomes[data_obj.weekday()]
+
+
+def montar_url_lotep20(data_obj):
+    dia_semana = nome_dia_semana_lotep20(data_obj)
+    data_url = data_obj.strftime("%d%m%y")
+
+    return (
+        f"{LOTEP20_URL_BASE}"
+        f"resultado-da-lotep-de-"
+        f"{dia_semana}-"
+        f"{data_url}/"
+    )
+
+
+def _normalizar_sem_acentos_lotep20(texto):
+    texto = normalizar_texto(texto).lower()
+
+    trocas = {
+        "á": "a",
+        "à": "a",
+        "ã": "a",
+        "â": "a",
+        "é": "e",
+        "ê": "e",
+        "í": "i",
+        "ó": "o",
+        "ô": "o",
+        "õ": "o",
+        "ú": "u",
+        "ç": "c",
+    }
+
+    for origem, destino in trocas.items():
+        texto = texto.replace(origem, destino)
+
+    return texto
+
+
+def _texto_tem_lotep20(texto):
+    texto = _normalizar_sem_acentos_lotep20(texto)
+
+    return (
+        "paratodos" in texto
+        and re.search(
+            r"\b20\s*(?:h|horas?)\b",
+            texto
+        ) is not None
+    )
+
+
+def _extrair_premios_de_tabela_lotep20(tabela):
+    premios = {}
+
+    for linha in tabela.find_all("tr"):
+        colunas = linha.find_all(["td", "th"])
+
+        if len(colunas) < 2:
+            continue
+
+        texto_primeira = normalizar_texto(
+            colunas[0].get_text(" ", strip=True)
+        )
+
+        match_premio = re.search(
+            r"\b([1-5])\s*[ºoªa]?\b",
+            texto_primeira,
+            flags=re.IGNORECASE,
+        )
+
+        if not match_premio:
+            continue
+
+        posicao = int(match_premio.group(1))
+        milhar = ""
+
+        for coluna in colunas[1:]:
+            texto_coluna = normalizar_texto(
+                coluna.get_text(" ", strip=True)
+            )
+
+            match_milhar = re.search(
+                r"(?<!\d)(\d{1,4})(?!\d)",
+                texto_coluna
+            )
+
+            if match_milhar:
+                milhar = match_milhar.group(1).zfill(4)
+                break
+
+        if milhar:
+            premios[posicao] = milhar
+
+    if not all(p in premios for p in range(1, 6)):
+        return []
+
+    return [
+        premios[1],
+        premios[2],
+        premios[3],
+        premios[4],
+        premios[5],
+    ]
+
+
+def extrair_lotep20_loterianacional(html, data_obj, url):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Estratégia 1: encontra o marcador "Paraíba PARATODOS 20 horas"
+    # e usa a primeira tabela realmente próxima dele.
+    candidatos = soup.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "strong", "p", "div"]
+    )
+
+    for marcador in candidatos:
+        texto_marcador = normalizar_texto(
+            marcador.get_text(" ", strip=True)
+        )
+
+        if not _texto_tem_lotep20(texto_marcador):
+            continue
+
+        tabela = marcador.find_next("table")
+
+        if tabela is None:
+            continue
+
+        elemento = marcador.find_next()
+        passos = 0
+
+        while (
+            elemento is not None
+            and elemento is not tabela
+            and passos < 35
+        ):
+            passos += 1
+            elemento = elemento.find_next()
+
+        if elemento is not tabela:
+            continue
+
+        premios = _extrair_premios_de_tabela_lotep20(tabela)
+
+        if len(premios) == 5:
+            m6, m7 = calcular_premios_6_7(premios)
+
+            return {
+                "data": data_obj.strftime("%d/%m/%Y"),
+                "loteria": "LOTEP",
+                "horario": "20",
+                "m1": premios[0],
+                "m2": premios[1],
+                "m3": premios[2],
+                "m4": premios[3],
+                "m5": premios[4],
+                "m6": m6,
+                "m7": m7,
+                "url": url,
+                "origem": "LOTERIA_NACIONAL",
+            }
+
+    # Estratégia 2: percorre tabelas e confere o contexto anterior.
+    for tabela in soup.find_all("table"):
+        elemento = tabela.find_previous()
+        contexto_ok = False
+        limite = 0
+
+        while elemento is not None and limite < 25:
+            limite += 1
+
+            try:
+                texto = normalizar_texto(
+                    elemento.get_text(" ", strip=True)
+                )
+            except Exception:
+                elemento = elemento.find_previous()
+                continue
+
+            if _texto_tem_lotep20(texto):
+                contexto_ok = True
+                break
+
+            elemento = elemento.find_previous()
+
+        if not contexto_ok:
+            continue
+
+        premios = _extrair_premios_de_tabela_lotep20(tabela)
+
+        if len(premios) != 5:
+            continue
+
+        m6, m7 = calcular_premios_6_7(premios)
+
+        return {
+            "data": data_obj.strftime("%d/%m/%Y"),
+            "loteria": "LOTEP",
+            "horario": "20",
+            "m1": premios[0],
+            "m2": premios[1],
+            "m3": premios[2],
+            "m4": premios[3],
+            "m5": premios[4],
+            "m6": m6,
+            "m7": m7,
+            "url": url,
+            "origem": "LOTERIA_NACIONAL",
+        }
+
+    return None
+
+
+def buscar_lotep20_data(data_obj):
+    url = montar_url_lotep20(data_obj)
+
+    try:
+        resp = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+        )
+
+    except Exception as e:
+        return {
+            "status": "erro_rede",
+            "resultado": None,
+            "url": url,
+            "erro": str(e),
+        }
+
+    if resp.status_code == 404:
+        return {
+            "status": "nao_encontrado",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code == 403:
+        return {
+            "status": "bloqueado_403",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code != 200:
+        return {
+            "status": f"http_{resp.status_code}",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    resultado = extrair_lotep20_loterianacional(
+        resp.text,
+        data_obj,
+        url,
+    )
+
+    if resultado is None:
+        return {
+            "status": "sem_lotep20",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    return {
+        "status": "ok",
+        "resultado": resultado,
+        "url": url,
+        "erro": "",
+    }
+
+
+def executar_coleta_lotep20():
+    global LOTEP20_THREAD
+
+    logging.info(
+        "Iniciando coleta histórica complementar LOTEP 20h."
+    )
+
+    datas_concluidas = carregar_datas_lotep20_concluidas()
+    chaves_resultados = carregar_chaves_lotep20()
+    estado = carregar_estado_lotep20()
+
+    estado.update({
+        "status": "executando",
+        "data_atual": None,
+        "dias_processados": len(datas_concluidas),
+        "resultados_coletados": len(chaves_resultados),
+        "falhas": 0,
+        "progresso": round(
+            (len(datas_concluidas) / LOTEP20_TOTAL_DIAS) * 100,
+            2
+        ),
+        "mensagem": "Coleta histórica LOTEP 20h em andamento.",
+    })
+
+    salvar_estado_lotep20(estado)
+
+    data_atual = LOTEP20_DATA_INICIAL
+
+    try:
+        while data_atual <= LOTEP20_DATA_FINAL:
+            data_br = data_atual.strftime("%d/%m/%Y")
+
+            if data_br in datas_concluidas:
+                data_atual += timedelta(days=1)
+                continue
+
+            estado["data_atual"] = data_br
+            estado["mensagem"] = (
+                f"Consultando LOTEP 20h em {data_br}."
+            )
+            salvar_estado_lotep20(estado)
+
+            retorno = buscar_lotep20_data(data_atual)
+
+            status = retorno.get("status", "desconhecido")
+            resultado = retorno.get("resultado")
+            novo = 0
+
+            if status == "ok" and resultado:
+                chave = (
+                    f"{resultado['data']}|"
+                    f"{resultado['loteria']}|"
+                    f"{resultado['horario']}"
+                )
+
+                if chave not in chaves_resultados:
+                    adicionar_jsonl(
+                        ARQUIVO_LOTEP20_RESULTADOS,
+                        resultado
+                    )
+                    chaves_resultados.add(chave)
+                    novo = 1
+
+            adicionar_jsonl(
+                ARQUIVO_LOTEP20_AUDITORIA,
+                {
+                    "data": data_br,
+                    "loteria": "LOTEP",
+                    "horario": "20",
+                    "status": status,
+                    "quantidade": 1 if resultado else 0,
+                    "novos": novo,
+                    "url": retorno.get("url", ""),
+                    "erro": retorno.get("erro", ""),
+                    "processado_em": datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    ),
+                }
+            )
+
+            if status in {
+                "ok",
+                "nao_encontrado",
+                "sem_lotep20",
+            }:
+                datas_concluidas.add(data_br)
+            else:
+                estado["falhas"] += 1
+
+            estado["dias_processados"] = len(datas_concluidas)
+            estado["resultados_coletados"] = len(chaves_resultados)
+            estado["progresso"] = round(
+                (len(datas_concluidas) / LOTEP20_TOTAL_DIAS) * 100,
+                2
+            )
+
+            salvar_estado_lotep20(estado)
+
+            time.sleep(0.8)
+            data_atual += timedelta(days=1)
+
+        estado.update({
+            "status": "concluida",
+            "data_atual": LOTEP20_DATA_FINAL.strftime("%d/%m/%Y"),
+            "dias_processados": len(datas_concluidas),
+            "resultados_coletados": len(chaves_resultados),
+            "progresso": round(
+                (len(datas_concluidas) / LOTEP20_TOTAL_DIAS) * 100,
+                2
+            ),
+            "mensagem": "Coleta histórica LOTEP 20h concluída.",
+        })
+
+        salvar_estado_lotep20(estado)
+
+    except Exception as e:
+        logging.exception("Falha geral na coleta LOTEP 20h.")
+
+        estado.update({
+            "status": "erro",
+            "mensagem": str(e),
+        })
+
+        salvar_estado_lotep20(estado)
+
+    finally:
+        with LOTEP20_LOCK:
+            LOTEP20_THREAD = None
+
+
+def gerar_excel_lotep20():
+    resultados = carregar_jsonl(ARQUIVO_LOTEP20_RESULTADOS)
+    auditoria = carregar_jsonl(ARQUIVO_LOTEP20_AUDITORIA)
+
+    if not resultados:
+        raise ValueError(
+            "Nenhum resultado LOTEP 20h foi coletado."
+        )
+
+    resultados.sort(
+        key=lambda item: datetime.strptime(
+            item.get("data", "01/01/1900"),
+            "%d/%m/%Y"
+        )
+    )
+
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "LOTEP 20H"
+
+    ws.append([
+        "Data",
+        "Loteria",
+        "Horário",
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M7",
+        "Origem",
+        "URL",
+    ])
+
+    for resultado in resultados:
+        ws.append([
+            resultado.get("data", ""),
+            resultado.get("loteria", "LOTEP"),
+            resultado.get("horario", "20"),
+            resultado.get("m1", ""),
+            resultado.get("m2", ""),
+            resultado.get("m3", ""),
+            resultado.get("m4", ""),
+            resultado.get("m5", ""),
+            resultado.get("m6", ""),
+            resultado.get("m7", ""),
+            resultado.get("origem", ""),
+            resultado.get("url", ""),
+        ])
+
+    for linha in range(2, ws.max_row + 1):
+        ws.cell(linha, 3).number_format = "@"
+
+        for coluna in range(4, 10):
+            celula = ws.cell(linha, coluna)
+            celula.value = str(celula.value).zfill(4)
+            celula.number_format = "@"
+
+        celula_m7 = ws.cell(linha, 10)
+        celula_m7.value = str(celula_m7.value).zfill(3)
+        celula_m7.number_format = "@"
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:L{ws.max_row}"
+
+    larguras = {
+        "A": 13,
+        "B": 12,
+        "C": 10,
+        "D": 9,
+        "E": 9,
+        "F": 9,
+        "G": 9,
+        "H": 9,
+        "I": 9,
+        "J": 9,
+        "K": 22,
+        "L": 85,
+    }
+
+    for coluna, largura in larguras.items():
+        ws.column_dimensions[coluna].width = largura
+
+    ws_auditoria = wb.create_sheet("AUDITORIA")
+
+    ws_auditoria.append([
+        "Data",
+        "Loteria",
+        "Horário",
+        "Status",
+        "Quantidade",
+        "Novos",
+        "URL",
+        "Erro",
+        "Processado em",
+    ])
+
+    for registro in auditoria:
+        ws_auditoria.append([
+            registro.get("data", ""),
+            registro.get("loteria", "LOTEP"),
+            registro.get("horario", "20"),
+            registro.get("status", ""),
+            registro.get("quantidade", 0),
+            registro.get("novos", 0),
+            registro.get("url", ""),
+            registro.get("erro", ""),
+            registro.get("processado_em", ""),
+        ])
+
+    ws_auditoria.freeze_panes = "A2"
+    ws_auditoria.auto_filter.ref = (
+        f"A1:I{ws_auditoria.max_row}"
+    )
+
+    ws_auditoria.column_dimensions["A"].width = 13
+    ws_auditoria.column_dimensions["B"].width = 12
+    ws_auditoria.column_dimensions["C"].width = 10
+    ws_auditoria.column_dimensions["D"].width = 22
+    ws_auditoria.column_dimensions["E"].width = 12
+    ws_auditoria.column_dimensions["F"].width = 10
+    ws_auditoria.column_dimensions["G"].width = 85
+    ws_auditoria.column_dimensions["H"].width = 45
+    ws_auditoria.column_dimensions["I"].width = 22
+
+    wb.save(ARQUIVO_LOTEP20_EXCEL)
+
+    return {
+        "resultados": len(resultados),
+        "auditoria": len(auditoria),
+        "arquivo": str(ARQUIVO_LOTEP20_EXCEL),
+    }
+
+
+# ==========================================================
+# ROTAS LOTEP 20H
+# ==========================================================
+
+@app.route("/lotep20/teste/<data_teste>")
+def teste_lotep20(data_teste):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    retorno = buscar_lotep20_data(data_obj)
+
+    return jsonify({
+        "ok": True,
+        "data_consulta": data_teste,
+        **retorno,
+    })
+
+
+@app.route("/lotep20/status")
+def status_lotep20():
+    estado = carregar_estado_lotep20()
+
+    return jsonify({
+        "ok": True,
+        "disco": str(DIRETORIO_DADOS),
+        "total_dias_previstos": LOTEP20_TOTAL_DIAS,
+        "estado": estado,
+        "arquivos": {
+            "estado": ARQUIVO_LOTEP20_ESTADO.exists(),
+            "resultados": ARQUIVO_LOTEP20_RESULTADOS.exists(),
+            "auditoria": ARQUIVO_LOTEP20_AUDITORIA.exists(),
+            "excel": ARQUIVO_LOTEP20_EXCEL.exists(),
+        },
+    })
+
+
+@app.route("/lotep20/iniciar")
+def iniciar_lotep20():
+    global LOTEP20_THREAD
+
+    with LOTEP20_LOCK:
+        if (
+            LOTEP20_THREAD is not None
+            and LOTEP20_THREAD.is_alive()
+        ):
+            return jsonify({
+                "ok": False,
+                "mensagem": (
+                    "A coleta LOTEP 20h já está em execução."
+                ),
+                "estado": carregar_estado_lotep20(),
+            }), 409
+
+        LOTEP20_THREAD = threading.Thread(
+            target=executar_coleta_lotep20,
+            name="coleta_lotep20",
+            daemon=True,
+        )
+
+        LOTEP20_THREAD.start()
+
+    return jsonify({
+        "ok": True,
+        "mensagem": (
+            "Coleta histórica LOTEP 20h iniciada."
+        ),
+        "periodo": {
+            "inicio": LOTEP20_DATA_INICIAL.strftime("%d/%m/%Y"),
+            "fim": LOTEP20_DATA_FINAL.strftime("%d/%m/%Y"),
+        },
+        "total_dias": LOTEP20_TOTAL_DIAS,
+        "status_url": "/lotep20/status",
+    })
+
+
+@app.route("/lotep20/gerar-excel")
+def rota_gerar_excel_lotep20():
+    estado = carregar_estado_lotep20()
+
+    if estado.get("status") != "concluida":
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A coleta LOTEP 20h ainda não foi concluída."
+            ),
+            "estado": estado,
+        }), 409
+
+    try:
+        resumo = gerar_excel_lotep20()
+
+        return jsonify({
+            "ok": True,
+            "mensagem": (
+                "Planilha LOTEP 20h gerada com sucesso."
+            ),
+            **resumo,
+            "download": "/lotep20/baixar",
+        })
+
+    except Exception as e:
+        logging.exception("Erro ao gerar Excel LOTEP 20h.")
+
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
+
+
+@app.route("/lotep20/baixar")
+def baixar_excel_lotep20():
+    if not ARQUIVO_LOTEP20_EXCEL.exists():
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A planilha LOTEP 20h ainda não foi gerada. "
+                "Acesse /lotep20/gerar-excel primeiro."
+            ),
+        }), 404
+
+    return send_file(
+        ARQUIVO_LOTEP20_EXCEL,
+        as_attachment=True,
+        download_name=(
+            "lotep20_01-01-2025_a_12-08-2026.xlsx"
+        ),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+
 
 # ==========================================================
 # ROTAS DE TESTE
