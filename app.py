@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import logging
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -147,45 +148,373 @@ def parece_federal(texto):
 
     return "federal" in texto
 
+def obter_campo_item(item, nomes):
+    """
+    O Resultado Fácil apresenta pequenas variações no JSON-LD.
+    Alguns registros usam name/value e outros podem aparecer
+    como nome/valor.
 
-def extrair_premios_bloco(bloco):
-    texto = normalizar_texto(
-        bloco.get_text(
-            " ",
-            strip=True
-        )
+    Esta função aceita essas variações.
+    """
+
+    for nome in nomes:
+        valor = item.get(nome)
+
+        if valor not in [None, ""]:
+            return str(valor).strip()
+
+    return ""
+
+
+def extrair_dataset_resultadofacil(html):
+    """
+    Localiza o Dataset de resultados dentro dos blocos JSON-LD.
+    """
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
     )
 
-    numeros = re.findall(
-        r"\b\d{1,4}\b",
+    scripts = soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"}
+    )
+
+    for script in scripts:
+        conteudo = script.string
+
+        if not conteudo:
+            conteudo = script.get_text(
+                strip=True
+            )
+
+        if not conteudo:
+            continue
+
+        try:
+            dados = json.loads(
+                conteudo
+            )
+        except Exception:
+            continue
+
+        grafo = dados.get(
+            "@graph",
+            []
+        )
+
+        if not isinstance(
+            grafo,
+            list
+        ):
+            continue
+
+        for item in grafo:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+                continue
+
+            tipo = str(
+                item.get(
+                    "@type",
+                    ""
+                )
+            ).lower()
+
+            if tipo != "dataset":
+                continue
+
+            variaveis = item.get(
+                "variableMeasured",
+                []
+            )
+
+            if isinstance(
+                variaveis,
+                list
+            ):
+                return {
+                    "dataset": item,
+                    "variaveis": variaveis,
+                }
+
+    return {
+        "dataset": None,
+        "variaveis": [],
+    }
+
+
+def normalizar_nome_resultado(texto):
+    texto = normalizar_texto(
         texto
     )
 
-    milhares = []
+    texto = texto.replace(
+        "º",
+        "o"
+    )
 
-    for numero in numeros:
-        milhar = formatar_milhar(
-            numero
+    texto = texto.replace(
+        "ª",
+        "a"
+    )
+
+    return texto
+
+
+def extrair_posicao_premio(texto):
+    """
+    Identifica somente posições de 1º a 5º prêmio.
+    """
+
+    texto = normalizar_nome_resultado(
+        texto
+    ).lower()
+
+    match = re.search(
+        r"\b([1-5])\s*[oa]?\s*pr[eê]mio\b",
+        texto
+    )
+
+    if not match:
+        return None
+
+    return int(
+        match.group(1)
+    )
+
+
+def extrair_horario_variavel(texto):
+    """
+    Obtém o horário do nome da variável do Dataset.
+
+    Exemplos:
+    PTSP 08:20
+    BA 10:20
+    LOTEP 10:45
+    CE 15:45
+    """
+
+    texto = normalizar_texto(
+        texto
+    )
+
+    horarios = re.findall(
+        r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
+        texto
+    )
+
+    if horarios:
+        hora = horarios[-1][0]
+
+        return hora.zfill(2)
+
+    match = re.search(
+        r"\b(\d{1,2})\s*h\b",
+        texto.lower()
+    )
+
+    if match:
+        return match.group(1).zfill(2)
+
+    return ""
+
+
+def pertence_loteria(
+    loteria,
+    nome_variavel
+):
+    """
+    Impede que resultados da Federal ou de outra banca
+    sejam incorporados à loteria analisada.
+    """
+
+    texto = normalizar_texto(
+        nome_variavel
+    ).upper()
+
+    # Federal misturada nas páginas
+    if "FEDERAL" in texto:
+        return False
+
+    if loteria == "PT-SP":
+        return (
+            "PTSP" in texto
+            or "PT SP" in texto
+            or "PTN SP" in texto
         )
 
-        if len(milhar) == 4:
-            milhares.append(milhar)
+    if loteria == "LOTEP":
+        return "LOTEP" in texto
 
-    # Remove repetições consecutivas simples
-    filtradas = []
+    if loteria == "PT-BA":
+        return (
+            " BA " in f" {texto} "
+            or texto.startswith("BA ")
+            or " - BA" in texto
+        )
 
-    for milhar in milhares:
-        if (
-            not filtradas
-            or filtradas[-1] != milhar
+    if loteria == "LOTECE":
+        return (
+            "LOTECE" in texto
+            or " CE," in texto
+            or " CE " in texto
+        )
+
+    return False
+
+
+def extrair_milhar_valor(valor):
+    """
+    O campo value normalmente vem assim:
+
+    5388 · Grupo 22 · Tigre
+
+    Captura apenas a primeira milhar.
+    """
+
+    valor = normalizar_texto(
+        valor
+    )
+
+    match = re.search(
+        r"(?<!\d)(\d{1,4})(?!\d)",
+        valor
+    )
+
+    if not match:
+        return ""
+
+    return match.group(1).zfill(4)
+
+
+def extrair_resultados_dataset(
+    html,
+    loteria,
+    data_obj,
+    url
+):
+    estrutura = extrair_dataset_resultadofacil(
+        html
+    )
+
+    variaveis = estrutura[
+        "variaveis"
+    ]
+
+    sorteios = {}
+
+    for item in variaveis:
+
+        if not isinstance(
+            item,
+            dict
         ):
-            filtradas.append(milhar)
+            continue
 
-    if len(filtradas) < 5:
-        return []
+        nome = obter_campo_item(
+            item,
+            [
+                "name",
+                "nome",
+            ]
+        )
 
-    return filtradas[:5]
+        valor = obter_campo_item(
+            item,
+            [
+                "value",
+                "valor",
+            ]
+        )
 
+        if not nome or not valor:
+            continue
+
+        if not pertence_loteria(
+            loteria,
+            nome
+        ):
+            continue
+
+        posicao = extrair_posicao_premio(
+            nome
+        )
+
+        if posicao is None:
+            continue
+
+        horario = extrair_horario_variavel(
+            nome
+        )
+
+        if not horario:
+            continue
+
+        milhar = extrair_milhar_valor(
+            valor
+        )
+
+        if not milhar:
+            continue
+
+        if horario not in sorteios:
+            sorteios[horario] = {}
+
+        sorteios[horario][
+            posicao
+        ] = milhar
+
+    resultados = []
+
+    for horario in sorted(
+        sorteios.keys()
+    ):
+
+        premios_dict = sorteios[
+            horario
+        ]
+
+        # Só aceita sorteio completo do 1º ao 5º
+        if not all(
+            p in premios_dict
+            for p in range(1, 6)
+        ):
+            continue
+
+        premios = [
+            premios_dict[1],
+            premios_dict[2],
+            premios_dict[3],
+            premios_dict[4],
+            premios_dict[5],
+        ]
+
+        m6, m7 = calcular_premios_6_7(
+            premios
+        )
+
+        resultados.append({
+            "data": data_obj.strftime(
+                "%d/%m/%Y"
+            ),
+            "loteria": loteria,
+            "horario": horario,
+            "m1": premios[0],
+            "m2": premios[1],
+            "m3": premios[2],
+            "m4": premios[3],
+            "m5": premios[4],
+            "m6": m6,
+            "m7": m7,
+            "url": url,
+        })
+
+    return resultados
 
 def buscar_resultados_data(
     loteria,
@@ -236,85 +565,20 @@ def buscar_resultados_data(
             "resultados": [],
         }
 
-    soup = BeautifulSoup(
+    resultados = extrair_resultados_dataset(
         resp.text,
-        "html.parser"
+        loteria,
+        data_obj,
+        url,
     )
 
-    resultados = []
-
-    # Procura blocos que possuam textos de horário
-    elementos = soup.find_all(
-        ["div", "section", "article", "table"]
-    )
-
-    chaves = set()
-
-    for elemento in elementos:
-        texto = normalizar_texto(
-            elemento.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not texto:
-            continue
-
-        horario = extrair_horario(
-            texto
-        )
-
-        if not horario:
-            continue
-
-        if parece_federal(texto):
-            continue
-
-        premios = extrair_premios_bloco(
-            elemento
-        )
-
-        if len(premios) != 5:
-            continue
-
-        m6, m7 = calcular_premios_6_7(
-            premios
-        )
-
-        data_br = data_obj.strftime(
-            "%d/%m/%Y"
-        )
-
-        chave = (
-            data_br,
-            loteria,
-            horario,
-            *premios,
-        )
-
-        if chave in chaves:
-            continue
-
-        chaves.add(chave)
-
-        resultados.append({
-            "data": data_br,
-            "loteria": loteria,
-            "horario": horario,
-            "m1": premios[0],
-            "m2": premios[1],
-            "m3": premios[2],
-            "m4": premios[3],
-            "m5": premios[4],
-            "m6": m6,
-            "m7": m7,
+    if not resultados:
+        return {
+            "ok": True,
+            "status": "sem_resultados_validos",
             "url": url,
-        })
-
-    resultados.sort(
-        key=lambda x: x["horario"]
-    )
+            "resultados": [],
+        }
 
     return {
         "ok": True,
