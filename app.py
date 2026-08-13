@@ -60,6 +60,14 @@ HEADERS = {
 }
 
 # ==========================================================
+# JB CERTO - DIAGNÓSTICO HISTÓRICO LOTEP 20H
+# ==========================================================
+
+URL_JBCERTO_LOTEP = (
+    "https://resultadosjbcerto.com.br/lotep/"
+)
+
+# ==========================================================
 # COLETA HISTÓRICA / DISCO PERSISTENTE
 # ==========================================================
 
@@ -1479,8 +1487,253 @@ def gerar_excel_historico():
     }
 
 # ==========================================================
+# DIAGNÓSTICO HISTÓRICO JB CERTO - LOTEP 20H
+# ==========================================================
+
+def diagnosticar_historico_lotep_20_jbcerto():
+
+    resp = requests.get(
+        URL_JBCERTO_LOTEP,
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(
+        resp.text,
+        "html.parser"
+    )
+
+    resultados = []
+
+    for tabela in soup.find_all("table"):
+
+        contexto = ""
+
+        anterior = tabela.find_previous(
+            ["h1", "h2", "h3", "h4", "strong"]
+        )
+
+        if anterior:
+            contexto = normalizar_texto(
+                anterior.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+        contexto_lower = contexto.lower()
+
+        # Queremos exclusivamente LOTEP 20h.
+        if "20" not in contexto_lower:
+            continue
+
+        linhas = tabela.find_all("tr")
+
+        premios = {}
+
+        for linha in linhas:
+
+            texto = normalizar_texto(
+                linha.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            match = re.search(
+                r"\b([1-5])\s*[ºo]?\s*"
+                r"(?:pr[eê]mio)?\D+"
+                r"(\d{1,4})\b",
+                texto,
+                flags=re.IGNORECASE,
+            )
+
+            if not match:
+                continue
+
+            posicao = int(
+                match.group(1)
+            )
+
+            milhar = match.group(
+                2
+            ).zfill(4)
+
+            premios[
+                posicao
+            ] = milhar
+
+        if not all(
+            p in premios
+            for p in range(1, 6)
+        ):
+            continue
+
+        # Procura uma data no contexto próximo da tabela.
+        bloco_pai = tabela.parent
+
+        texto_proximo = normalizar_texto(
+            bloco_pai.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        match_data = re.search(
+            r"\b(\d{2}/\d{2}/\d{4})\b",
+            texto_proximo
+        )
+
+        if not match_data:
+
+            # Tenta procurar nos elementos anteriores.
+            anterior_data = tabela.find_previous(
+                string=re.compile(
+                    r"\d{2}/\d{2}/\d{4}"
+                )
+            )
+
+            if anterior_data:
+
+                match_data = re.search(
+                    r"\b(\d{2}/\d{2}/\d{4})\b",
+                    str(anterior_data)
+                )
+
+        if not match_data:
+            continue
+
+        data = match_data.group(
+            1
+        )
+
+        lista_premios = [
+            premios[1],
+            premios[2],
+            premios[3],
+            premios[4],
+            premios[5],
+        ]
+
+        m6, m7 = calcular_premios_6_7(
+            lista_premios
+        )
+
+        resultados.append({
+            "data": data,
+            "loteria": "LOTEP",
+            "horario": "20",
+            "m1": premios[1],
+            "m2": premios[2],
+            "m3": premios[3],
+            "m4": premios[4],
+            "m5": premios[5],
+            "m6": m6,
+            "m7": m7,
+            "titulo": contexto,
+        })
+
+    # Remove eventual duplicidade.
+    unicos = {}
+
+    for resultado in resultados:
+
+        chave = (
+            resultado["data"],
+            resultado["horario"],
+        )
+
+        unicos[
+            chave
+        ] = resultado
+
+    resultados = list(
+        unicos.values()
+    )
+
+    def chave_ordenacao(item):
+
+        try:
+            return datetime.strptime(
+                item["data"],
+                "%d/%m/%Y"
+            )
+
+        except Exception:
+            return datetime.min
+
+    resultados.sort(
+        key=chave_ordenacao
+    )
+
+    datas_validas = []
+
+    for resultado in resultados:
+
+        try:
+            datas_validas.append(
+                datetime.strptime(
+                    resultado["data"],
+                    "%d/%m/%Y"
+                )
+            )
+
+        except Exception:
+            pass
+
+    return {
+        "url": URL_JBCERTO_LOTEP,
+        "total": len(
+            resultados
+        ),
+        "primeira_data": (
+            min(datas_validas).strftime(
+                "%d/%m/%Y"
+            )
+            if datas_validas
+            else None
+        ),
+        "ultima_data": (
+            max(datas_validas).strftime(
+                "%d/%m/%Y"
+            )
+            if datas_validas
+            else None
+        ),
+        "resultados": resultados,
+    }
+
+# ==========================================================
 # ROTAS DE TESTE
 # ==========================================================
+
+@app.route("/diagnostico-lotep-20")
+def diagnostico_lotep_20():
+
+    try:
+
+        resultado = (
+            diagnosticar_historico_lotep_20_jbcerto()
+        )
+
+        return jsonify({
+            "ok": True,
+            **resultado,
+        })
+
+    except Exception as e:
+
+        logging.exception(
+            "Erro no diagnóstico histórico "
+            "da LOTEP 20h."
+        )
+
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
 
 @app.route("/coleta/status")
 def status_coleta():
