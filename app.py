@@ -323,6 +323,26 @@ def buscar_resultados_data(
         "resultados": resultados,
     }
 
+def diagnosticar_pagina_resultadofacil(loteria, data_obj):
+    url = montar_url(
+        loteria,
+        data_obj
+    )
+
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    return {
+        "status_http": resp.status_code,
+        "url": url,
+        "html": resp.text[:50000],
+    }
+    
+
+
 
 # ==========================================================
 # ROTAS DE TESTE
@@ -383,6 +403,50 @@ def teste_loteria(
     )
 
     return jsonify(retorno)
+
+@app.route(
+    "/debug-html/<loteria>/<data_teste>"
+)
+def debug_html(
+    loteria,
+    data_teste
+):
+    loteria = loteria.upper()
+
+    if loteria not in LOTERIAS:
+        return jsonify({
+            "ok": False,
+            "erro": "Loteria inválida",
+        }), 400
+
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    try:
+        retorno = diagnosticar_pagina_resultadofacil(
+            loteria,
+            data_obj
+        )
+
+        return jsonify({
+            "ok": True,
+            **retorno,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
 
 
 @app.route("/teste-periodo")
