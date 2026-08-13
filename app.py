@@ -3,6 +3,8 @@ import re
 import time
 import json
 import logging
+import threading
+from pathlib import Path
 from datetime import datetime, timedelta
 from io import BytesIO
 
@@ -56,6 +58,143 @@ HEADERS = {
     ),
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
 }
+
+# ==========================================================
+# COLETA HISTÓRICA / DISCO PERSISTENTE
+# ==========================================================
+
+DATA_INICIAL_COLETA = datetime(
+    2025,
+    1,
+    1
+)
+
+DATA_FINAL_COLETA = datetime(
+    2026,
+    8,
+    12
+)
+
+DIRETORIO_DADOS = Path(
+    os.environ.get(
+        "DATA_DIR",
+        "/var/data"
+    )
+)
+
+DIRETORIO_DADOS.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+ARQUIVO_ESTADO = (
+    DIRETORIO_DADOS
+    / "estado_coleta.json"
+)
+
+ARQUIVO_RESULTADOS = (
+    DIRETORIO_DADOS
+    / "resultados.jsonl"
+)
+
+ARQUIVO_AUDITORIA = (
+    DIRETORIO_DADOS
+    / "auditoria.jsonl"
+)
+
+ARQUIVO_EXCEL = (
+    DIRETORIO_DADOS
+    / "resultadofacil_2025_2026.xlsx"
+)
+
+COLETA_LOCK = threading.Lock()
+
+def estado_inicial_coleta():
+    return {
+        "status": "nao_iniciada",
+        "data_inicial": DATA_INICIAL_COLETA.strftime(
+            "%d/%m/%Y"
+        ),
+        "data_final": DATA_FINAL_COLETA.strftime(
+            "%d/%m/%Y"
+        ),
+        "data_atual": None,
+        "loteria_atual": None,
+        "paginas_processadas": 0,
+        "resultados_coletados": 0,
+        "falhas": 0,
+        "progresso": 0.0,
+        "mensagem": (
+            "A coleta ainda não foi iniciada."
+        ),
+    }
+
+
+def salvar_estado_coleta(estado):
+    temporario = ARQUIVO_ESTADO.with_suffix(
+        ".tmp"
+    )
+
+    with open(
+        temporario,
+        "w",
+        encoding="utf-8"
+    ) as arquivo:
+        json.dump(
+            estado,
+            arquivo,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(
+        temporario,
+        ARQUIVO_ESTADO
+    )
+
+
+def carregar_estado_coleta():
+    if not ARQUIVO_ESTADO.exists():
+        estado = estado_inicial_coleta()
+        salvar_estado_coleta(
+            estado
+        )
+        return estado
+
+    try:
+        with open(
+            ARQUIVO_ESTADO,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            return json.load(
+                arquivo
+            )
+
+    except Exception:
+        logging.exception(
+            "Erro ao carregar estado da coleta."
+        )
+
+        return estado_inicial_coleta()
+
+
+def adicionar_jsonl(
+    caminho,
+    registro
+):
+    with open(
+        caminho,
+        "a",
+        encoding="utf-8"
+    ) as arquivo:
+        arquivo.write(
+            json.dumps(
+                registro,
+                ensure_ascii=False,
+            )
+        )
+        arquivo.write("\n")
 
 
 # ==========================================================
@@ -611,6 +750,24 @@ def diagnosticar_pagina_resultadofacil(loteria, data_obj):
 # ==========================================================
 # ROTAS DE TESTE
 # ==========================================================
+
+@app.route("/coleta/status")
+def status_coleta():
+    estado = carregar_estado_coleta()
+
+    return jsonify({
+        "ok": True,
+        "disco": str(
+            DIRETORIO_DADOS
+        ),
+        "estado": estado,
+        "arquivos": {
+            "estado": ARQUIVO_ESTADO.exists(),
+            "resultados": ARQUIVO_RESULTADOS.exists(),
+            "auditoria": ARQUIVO_AUDITORIA.exists(),
+            "excel": ARQUIVO_EXCEL.exists(),
+        },
+    })
 
 @app.route("/")
 def home():
