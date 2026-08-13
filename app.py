@@ -99,7 +99,7 @@ def calcular_premios_6_7(premios):
 
 
 def montar_url(loteria, data_obj):
-    cfg = LOTerias[loteria]
+    cfg = LOTERIAS[loteria]
 
     data_iso = data_obj.strftime(
         "%Y-%m-%d"
@@ -353,12 +353,12 @@ def teste_loteria(
 ):
     loteria = loteria.upper()
 
-    if loteria not in LOTerias:
+    if loteria not in LOTERIAS:
         return jsonify({
             "ok": False,
             "erro": "Loteria inválida",
             "loterias": list(
-                LOTerias.keys()
+                LOTERIAS.keys()
             ),
         }), 400
 
@@ -405,7 +405,7 @@ def teste_periodo():
 
     while data_atual <= data_fim:
 
-        for loteria in LOTerias:
+        for loteria in LOTERIAS:
 
             retorno = buscar_resultados_data(
                 loteria,
