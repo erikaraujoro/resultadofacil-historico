@@ -164,6 +164,55 @@ PTSP15_TOTAL_DIAS = (
     - PTSP15_DATA_INICIAL.date()
 ).days + 1
 
+
+# ==========================================================
+# NOVA COLETA HISTÓRICA
+# AVAL-PE + CAMINHO-DA-SORTE + MINAS-MG
+# Período: 01/01/2025 a 14/08/2026
+# ==========================================================
+
+NOVAS_LOTERIAS = {
+    "AVAL-PE": {
+        "slug": "resultados-aval-pernambuco-do-dia-",
+        "url_base": "https://www.resultadofacil.com.br/",
+        "horarios_origem": {"09", "11", "12", "14", "15", "17", "19"},
+        "normalizacao_horarios": {},
+    },
+    "CAMINHO-DA-SORTE": {
+        "slug": "resultados-caminho-da-sorte-do-dia-",
+        "url_base": "https://www.resultadofacil.com.br/",
+        "horarios_origem": {"09", "11", "12", "14", "15", "17", "18", "20", "21"},
+        "normalizacao_horarios": {"20": "19"},
+    },
+    "MINAS-MG": {
+        "slug": "resultados-minas-mg-do-dia-",
+        "url_base": "https://www.resultadofacil.com.br/",
+        "horarios_origem": {"12", "15", "19", "21"},
+        "normalizacao_horarios": {},
+    },
+}
+
+NOVAS_DATA_INICIAL = datetime(2025, 1, 1)
+NOVAS_DATA_FINAL = datetime(2026, 8, 14)
+
+ARQUIVO_NOVAS_ESTADO = DIRETORIO_DADOS / "novas_loterias_estado.json"
+ARQUIVO_NOVAS_RESULTADOS = DIRETORIO_DADOS / "novas_loterias_resultados.jsonl"
+ARQUIVO_NOVAS_AUDITORIA = DIRETORIO_DADOS / "novas_loterias_auditoria.jsonl"
+ARQUIVO_NOVAS_EXCEL = DIRETORIO_DADOS / "aval_pe_caminho_da_sorte_minas_mg_2025_2026.xlsx"
+
+NOVAS_LOCK = threading.Lock()
+NOVAS_THREAD = None
+
+NOVAS_TOTAL_DIAS = (
+    NOVAS_DATA_FINAL.date()
+    - NOVAS_DATA_INICIAL.date()
+).days + 1
+
+NOVAS_TOTAL_PAGINAS = (
+    NOVAS_TOTAL_DIAS
+    * len(NOVAS_LOTERIAS)
+)
+
 COLETA_LOCK = threading.Lock()
 
 COLETA_THREAD = None
@@ -1534,6 +1583,793 @@ def gerar_excel_historico():
             ARQUIVO_EXCEL
         ),
     }
+
+
+# ==========================================================
+# NOVA COLETA HISTÓRICA
+# AVAL-PE + CAMINHO-DA-SORTE + MINAS-MG
+# ==========================================================
+
+def novas_estado_inicial():
+    return {
+        "status": "nao_iniciada",
+        "data_inicial": NOVAS_DATA_INICIAL.strftime("%d/%m/%Y"),
+        "data_final": NOVAS_DATA_FINAL.strftime("%d/%m/%Y"),
+        "data_atual": None,
+        "loteria_atual": None,
+        "paginas_processadas": 0,
+        "resultados_coletados": 0,
+        "falhas": 0,
+        "progresso": 0.0,
+        "mensagem": "A coleta das novas loterias ainda não foi iniciada.",
+    }
+
+
+def salvar_estado_novas(estado):
+    temporario = ARQUIVO_NOVAS_ESTADO.with_suffix(".tmp")
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(estado, arquivo, ensure_ascii=False, indent=2)
+    os.replace(temporario, ARQUIVO_NOVAS_ESTADO)
+
+
+def carregar_estado_novas():
+    if not ARQUIVO_NOVAS_ESTADO.exists():
+        estado = novas_estado_inicial()
+        salvar_estado_novas(estado)
+        return estado
+
+    try:
+        with open(ARQUIVO_NOVAS_ESTADO, "r", encoding="utf-8") as arquivo:
+            return json.load(arquivo)
+    except Exception:
+        logging.exception("Erro ao carregar estado das novas loterias.")
+        return novas_estado_inicial()
+
+
+def carregar_chaves_novas():
+    chaves = set()
+
+    if not ARQUIVO_NOVAS_RESULTADOS.exists():
+        return chaves
+
+    with open(ARQUIVO_NOVAS_RESULTADOS, "r", encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except Exception:
+                continue
+
+            chaves.add(
+                f"{registro.get('data', '')}|"
+                f"{registro.get('loteria', '')}|"
+                f"{registro.get('horario', '')}"
+            )
+
+    return chaves
+
+
+def carregar_paginas_novas_concluidas():
+    concluidas = set()
+
+    if not ARQUIVO_NOVAS_AUDITORIA.exists():
+        return concluidas
+
+    with open(ARQUIVO_NOVAS_AUDITORIA, "r", encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except Exception:
+                continue
+
+            if registro.get("status") not in {
+                "ok",
+                "nao_encontrado",
+                "sem_resultados_validos",
+            }:
+                continue
+
+            concluidas.add(
+                f"{registro.get('data', '')}|"
+                f"{registro.get('loteria', '')}"
+            )
+
+    return concluidas
+
+
+def montar_url_nova_loteria(loteria, data_obj):
+    cfg = NOVAS_LOTERIAS[loteria]
+    data_iso = data_obj.strftime("%Y-%m-%d")
+    return cfg["url_base"] + cfg["slug"] + data_iso
+
+
+def pertence_nova_loteria(loteria, nome_variavel):
+    texto = normalizar_texto(nome_variavel).upper()
+
+    if "FEDERAL" in texto:
+        return False
+
+    if loteria == "AVAL-PE":
+        return (
+            "AVAL" in texto
+            or "PERNAMBUCO" in texto
+            or " PE " in f" {texto} "
+        )
+
+    if loteria == "CAMINHO-DA-SORTE":
+        return (
+            "CAMINHO DA SORTE" in texto
+            or "CAMINHO" in texto
+        )
+
+    if loteria == "MINAS-MG":
+        return (
+            "MINAS" in texto
+            or " MG " in f" {texto} "
+            or texto.startswith("MG ")
+        )
+
+    return False
+
+
+def extrair_resultados_nova_loteria(html, loteria, data_obj, url):
+    estrutura = extrair_dataset_resultadofacil(html)
+    variaveis = estrutura.get("variaveis", [])
+
+    cfg = NOVAS_LOTERIAS[loteria]
+    horarios_origem = cfg["horarios_origem"]
+    normalizacao = cfg["normalizacao_horarios"]
+
+    sorteios = {}
+
+    for item in variaveis:
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
+
+        if not nome or not valor:
+            continue
+
+        if parece_federal(nome):
+            continue
+
+        if not pertence_nova_loteria(loteria, nome):
+            continue
+
+        horario_origem = extrair_horario_variavel(nome)
+
+        if horario_origem not in horarios_origem:
+            continue
+
+        horario_destino = normalizacao.get(
+            horario_origem,
+            horario_origem
+        )
+
+        posicao = extrair_posicao_premio(nome)
+        if posicao is None:
+            continue
+
+        milhar = extrair_milhar_valor(valor)
+        if not milhar:
+            continue
+
+        sorteios.setdefault(horario_destino, {})
+        sorteios[horario_destino][posicao] = milhar
+
+    resultados = []
+
+    for horario in sorted(sorteios.keys()):
+        premios_dict = sorteios[horario]
+
+        if not all(p in premios_dict for p in range(1, 6)):
+            continue
+
+        premios = [
+            premios_dict[1],
+            premios_dict[2],
+            premios_dict[3],
+            premios_dict[4],
+            premios_dict[5],
+        ]
+
+        m6, m7 = calcular_premios_6_7(premios)
+
+        resultados.append({
+            "data": data_obj.strftime("%d/%m/%Y"),
+            "loteria": loteria,
+            "horario": horario,
+            "m1": premios[0],
+            "m2": premios[1],
+            "m3": premios[2],
+            "m4": premios[3],
+            "m5": premios[4],
+            "m6": m6,
+            "m7": m7,
+            "url": url,
+            "origem": "RESULTADO_FACIL",
+        })
+
+    return resultados
+
+
+def buscar_nova_loteria_data(loteria, data_obj):
+    url = montar_url_nova_loteria(loteria, data_obj)
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+    except Exception as e:
+        return {
+            "ok": False,
+            "status": "erro_rede",
+            "erro": str(e),
+            "url": url,
+            "resultados": [],
+        }
+
+    if resp.status_code == 404:
+        return {
+            "ok": True,
+            "status": "nao_encontrado",
+            "url": url,
+            "resultados": [],
+        }
+
+    if resp.status_code == 403:
+        return {
+            "ok": False,
+            "status": "bloqueado_403",
+            "url": url,
+            "resultados": [],
+        }
+
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "status": f"http_{resp.status_code}",
+            "url": url,
+            "resultados": [],
+        }
+
+    resultados = extrair_resultados_nova_loteria(
+        resp.text,
+        loteria,
+        data_obj,
+        url,
+    )
+
+    if not resultados:
+        return {
+            "ok": True,
+            "status": "sem_resultados_validos",
+            "url": url,
+            "resultados": [],
+        }
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "url": url,
+        "resultados": resultados,
+    }
+
+
+def executar_coleta_novas_loterias():
+    global NOVAS_THREAD
+
+    chaves_resultados = carregar_chaves_novas()
+    paginas_concluidas = carregar_paginas_novas_concluidas()
+    estado = carregar_estado_novas()
+
+    estado.update({
+        "status": "executando",
+        "data_atual": None,
+        "loteria_atual": None,
+        "paginas_processadas": len(paginas_concluidas),
+        "resultados_coletados": len(chaves_resultados),
+        "falhas": 0,
+        "progresso": round(
+            (len(paginas_concluidas) / NOVAS_TOTAL_PAGINAS) * 100,
+            2
+        ),
+        "mensagem": "Coleta histórica das novas loterias em andamento.",
+    })
+
+    salvar_estado_novas(estado)
+
+    data_atual = NOVAS_DATA_INICIAL
+
+    try:
+        while data_atual <= NOVAS_DATA_FINAL:
+            data_br = data_atual.strftime("%d/%m/%Y")
+
+            for loteria in NOVAS_LOTERIAS:
+                chave_pagina = f"{data_br}|{loteria}"
+
+                if chave_pagina in paginas_concluidas:
+                    continue
+
+                estado["data_atual"] = data_br
+                estado["loteria_atual"] = loteria
+                estado["mensagem"] = f"Consultando {loteria} em {data_br}."
+                salvar_estado_novas(estado)
+
+                retorno = buscar_nova_loteria_data(
+                    loteria,
+                    data_atual
+                )
+
+                status = retorno.get("status", "desconhecido")
+                resultados = retorno.get("resultados", [])
+                novos = 0
+
+                if status == "ok":
+                    for resultado in resultados:
+                        chave = (
+                            f"{resultado['data']}|"
+                            f"{resultado['loteria']}|"
+                            f"{resultado['horario']}"
+                        )
+
+                        if chave in chaves_resultados:
+                            continue
+
+                        adicionar_jsonl(
+                            ARQUIVO_NOVAS_RESULTADOS,
+                            resultado
+                        )
+                        chaves_resultados.add(chave)
+                        novos += 1
+
+                adicionar_jsonl(
+                    ARQUIVO_NOVAS_AUDITORIA,
+                    {
+                        "data": data_br,
+                        "loteria": loteria,
+                        "status": status,
+                        "quantidade": len(resultados),
+                        "novos": novos,
+                        "url": retorno.get("url", ""),
+                        "erro": retorno.get("erro", ""),
+                        "processado_em": datetime.now().strftime(
+                            "%d/%m/%Y %H:%M:%S"
+                        ),
+                    }
+                )
+
+                if status in {
+                    "ok",
+                    "nao_encontrado",
+                    "sem_resultados_validos",
+                }:
+                    paginas_concluidas.add(chave_pagina)
+                else:
+                    estado["falhas"] += 1
+
+                estado["paginas_processadas"] = len(paginas_concluidas)
+                estado["resultados_coletados"] = len(chaves_resultados)
+                estado["progresso"] = round(
+                    (len(paginas_concluidas) / NOVAS_TOTAL_PAGINAS) * 100,
+                    2
+                )
+                salvar_estado_novas(estado)
+
+                time.sleep(0.8)
+
+            data_atual += timedelta(days=1)
+
+        estado.update({
+            "status": "concluida",
+            "data_atual": NOVAS_DATA_FINAL.strftime("%d/%m/%Y"),
+            "loteria_atual": None,
+            "paginas_processadas": len(paginas_concluidas),
+            "resultados_coletados": len(chaves_resultados),
+            "progresso": round(
+                (len(paginas_concluidas) / NOVAS_TOTAL_PAGINAS) * 100,
+                2
+            ),
+            "mensagem": "Coleta histórica das novas loterias concluída.",
+        })
+        salvar_estado_novas(estado)
+
+    except Exception as e:
+        logging.exception(
+            "Falha geral na coleta das novas loterias."
+        )
+        estado.update({
+            "status": "erro",
+            "mensagem": str(e),
+        })
+        salvar_estado_novas(estado)
+
+    finally:
+        with NOVAS_LOCK:
+            NOVAS_THREAD = None
+
+
+def gerar_excel_novas_loterias():
+    resultados = carregar_jsonl(
+        ARQUIVO_NOVAS_RESULTADOS
+    )
+    auditoria = carregar_jsonl(
+        ARQUIVO_NOVAS_AUDITORIA
+    )
+
+    if not resultados:
+        raise ValueError(
+            "Nenhum resultado das novas loterias foi coletado."
+        )
+
+    ordem = {
+        "AVAL-PE": 1,
+        "CAMINHO-DA-SORTE": 2,
+        "MINAS-MG": 3,
+    }
+
+    resultados.sort(
+        key=lambda item: (
+            datetime.strptime(
+                item.get("data", "01/01/1900"),
+                "%d/%m/%Y"
+            ),
+            ordem.get(
+                item.get("loteria", ""),
+                999
+            ),
+            str(item.get("horario", "")).zfill(2),
+        )
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "RESULTADOS"
+
+    ws.append([
+        "Data",
+        "Loteria",
+        "Horário",
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M7",
+    ])
+
+    for resultado in resultados:
+        ws.append([
+            resultado.get("data", ""),
+            resultado.get("loteria", ""),
+            resultado.get("horario", ""),
+            resultado.get("m1", ""),
+            resultado.get("m2", ""),
+            resultado.get("m3", ""),
+            resultado.get("m4", ""),
+            resultado.get("m5", ""),
+            resultado.get("m6", ""),
+            resultado.get("m7", ""),
+        ])
+
+    for linha in range(2, ws.max_row + 1):
+        ws.cell(linha, 3).number_format = "@"
+
+        for coluna in range(4, 10):
+            celula = ws.cell(linha, coluna)
+            celula.value = str(celula.value).zfill(4)
+            celula.number_format = "@"
+
+        celula_m7 = ws.cell(linha, 10)
+        celula_m7.value = str(celula_m7.value).zfill(3)
+        celula_m7.number_format = "@"
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:J{ws.max_row}"
+
+    for coluna, largura in {
+        "A": 13,
+        "B": 24,
+        "C": 10,
+        "D": 9,
+        "E": 9,
+        "F": 9,
+        "G": 9,
+        "H": 9,
+        "I": 9,
+        "J": 9,
+    }.items():
+        ws.column_dimensions[coluna].width = largura
+
+    ws_auditoria = wb.create_sheet("AUDITORIA")
+    ws_auditoria.append([
+        "Data",
+        "Loteria",
+        "Status",
+        "Quantidade",
+        "Novos",
+        "URL",
+        "Erro",
+        "Processado em",
+    ])
+
+    for registro in auditoria:
+        ws_auditoria.append([
+            registro.get("data", ""),
+            registro.get("loteria", ""),
+            registro.get("status", ""),
+            registro.get("quantidade", 0),
+            registro.get("novos", 0),
+            registro.get("url", ""),
+            registro.get("erro", ""),
+            registro.get("processado_em", ""),
+        ])
+
+    wb.save(ARQUIVO_NOVAS_EXCEL)
+
+    return {
+        "resultados": len(resultados),
+        "auditoria": len(auditoria),
+        "arquivo": str(ARQUIVO_NOVAS_EXCEL),
+    }
+
+
+# ==========================================================
+# ROTAS DAS NOVAS LOTERIAS
+# ==========================================================
+
+@app.route("/novas-loterias/teste/<loteria>/<data_teste>")
+def teste_nova_loteria(loteria, data_teste):
+    loteria = loteria.upper()
+
+    if loteria not in NOVAS_LOTERIAS:
+        return jsonify({
+            "ok": False,
+            "erro": "Loteria inválida.",
+            "loterias": list(NOVAS_LOTERIAS.keys()),
+        }), 400
+
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    retorno = buscar_nova_loteria_data(
+        loteria,
+        data_obj
+    )
+
+    return jsonify({
+        "ok": True,
+        "data_consulta": data_teste,
+        "loteria": loteria,
+        **retorno,
+    })
+
+
+@app.route("/novas-loterias/debug/<loteria>/<data_teste>")
+def debug_nova_loteria(loteria, data_teste):
+    loteria = loteria.upper()
+
+    if loteria not in NOVAS_LOTERIAS:
+        return jsonify({
+            "ok": False,
+            "erro": "Loteria inválida.",
+        }), 400
+
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    url = montar_url_nova_loteria(
+        loteria,
+        data_obj
+    )
+
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    estrutura = extrair_dataset_resultadofacil(
+        resp.text
+    )
+
+    candidatos = []
+
+    for item in estrutura.get("variaveis", []):
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(
+            item,
+            ["name", "nome"]
+        )
+        valor = obter_campo_item(
+            item,
+            ["value", "valor"]
+        )
+        horario = extrair_horario_variavel(
+            nome
+        )
+
+        candidatos.append({
+            "nome": nome,
+            "valor": valor,
+            "horario_origem": horario,
+            "horario_destino": (
+                NOVAS_LOTERIAS[
+                    loteria
+                ]["normalizacao_horarios"].get(
+                    horario,
+                    horario
+                )
+            ),
+            "posicao": extrair_posicao_premio(
+                nome
+            ),
+            "federal": parece_federal(
+                nome
+            ),
+            "aceito_banca": pertence_nova_loteria(
+                loteria,
+                nome
+            ),
+            "horario_valido": (
+                horario
+                in NOVAS_LOTERIAS[
+                    loteria
+                ]["horarios_origem"]
+            ),
+        })
+
+    return jsonify({
+        "ok": True,
+        "status_http": resp.status_code,
+        "url": url,
+        "total_variaveis_dataset": len(
+            estrutura.get("variaveis", [])
+        ),
+        "candidatos": candidatos,
+    })
+
+
+@app.route("/novas-loterias/status")
+def status_novas_loterias():
+    estado = carregar_estado_novas()
+
+    return jsonify({
+        "ok": True,
+        "disco": str(DIRETORIO_DADOS),
+        "total_dias_previstos": NOVAS_TOTAL_DIAS,
+        "total_paginas_previstas": NOVAS_TOTAL_PAGINAS,
+        "estado": estado,
+        "arquivos": {
+            "estado": ARQUIVO_NOVAS_ESTADO.exists(),
+            "resultados": ARQUIVO_NOVAS_RESULTADOS.exists(),
+            "auditoria": ARQUIVO_NOVAS_AUDITORIA.exists(),
+            "excel": ARQUIVO_NOVAS_EXCEL.exists(),
+        },
+    })
+
+
+@app.route("/novas-loterias/iniciar")
+def iniciar_novas_loterias():
+    global NOVAS_THREAD
+
+    with NOVAS_LOCK:
+        if (
+            NOVAS_THREAD is not None
+            and NOVAS_THREAD.is_alive()
+        ):
+            return jsonify({
+                "ok": False,
+                "mensagem": (
+                    "A coleta das novas loterias já está em execução."
+                ),
+                "estado": carregar_estado_novas(),
+            }), 409
+
+        NOVAS_THREAD = threading.Thread(
+            target=executar_coleta_novas_loterias,
+            name="coleta_novas_loterias",
+            daemon=True,
+        )
+        NOVAS_THREAD.start()
+
+    return jsonify({
+        "ok": True,
+        "mensagem": (
+            "Coleta histórica das novas loterias iniciada."
+        ),
+        "periodo": {
+            "inicio": NOVAS_DATA_INICIAL.strftime("%d/%m/%Y"),
+            "fim": NOVAS_DATA_FINAL.strftime("%d/%m/%Y"),
+        },
+        "loterias": list(NOVAS_LOTERIAS.keys()),
+        "total_paginas": NOVAS_TOTAL_PAGINAS,
+        "status_url": "/novas-loterias/status",
+    })
+
+
+@app.route("/novas-loterias/gerar-excel")
+def rota_gerar_excel_novas_loterias():
+    estado = carregar_estado_novas()
+
+    if estado.get("status") != "concluida":
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A coleta das novas loterias ainda não foi concluída."
+            ),
+            "estado": estado,
+        }), 409
+
+    try:
+        resumo = gerar_excel_novas_loterias()
+
+        return jsonify({
+            "ok": True,
+            "mensagem": (
+                "Planilha das novas loterias gerada com sucesso."
+            ),
+            **resumo,
+            "download": "/novas-loterias/baixar",
+        })
+    except Exception as e:
+        logging.exception(
+            "Erro ao gerar Excel das novas loterias."
+        )
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
+
+
+@app.route("/novas-loterias/baixar")
+def baixar_excel_novas_loterias():
+    if not ARQUIVO_NOVAS_EXCEL.exists():
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A planilha das novas loterias ainda não foi gerada. "
+                "Acesse /novas-loterias/gerar-excel primeiro."
+            ),
+        }), 404
+
+    return send_file(
+        ARQUIVO_NOVAS_EXCEL,
+        as_attachment=True,
+        download_name=(
+            "aval_pe_caminho_da_sorte_minas_mg_"
+            "01-01-2025_a_14-08-2026.xlsx"
+        ),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+
 
 # ==========================================================
 # DIAGNÓSTICO HISTÓRICO JB CERTO - LOTEP 20H
