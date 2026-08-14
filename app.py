@@ -1689,32 +1689,30 @@ def montar_url_nova_loteria(loteria, data_obj):
 
 
 def pertence_nova_loteria(loteria, nome_variavel):
+    """
+    As páginas consultadas já são específicas de cada conjunto
+    de resultados no Resultado Fácil.
+
+    Por isso, para estas três novas loterias, a validação principal é:
+    1) a página/URL correta;
+    2) o horário estar na lista permitida;
+    3) o bloco NÃO ser Federal.
+
+    Isso é importante porque o Resultado Fácil usa nomes diferentes
+    dentro da mesma página. Exemplo MINAS-MG:
+      12h -> ALVORADA - MG
+      15h -> MINAS DIA - MG
+      19h -> MINAS NOITE - MG
+      21h -> PREFERIDA - MG
+
+    AVAL-PE também pode usar denominações diferentes em alguns horários.
+    """
     texto = normalizar_texto(nome_variavel).upper()
 
     if "FEDERAL" in texto:
         return False
 
-    if loteria == "AVAL-PE":
-        return (
-            "AVAL" in texto
-            or "PERNAMBUCO" in texto
-            or " PE " in f" {texto} "
-        )
-
-    if loteria == "CAMINHO-DA-SORTE":
-        return (
-            "CAMINHO DA SORTE" in texto
-            or "CAMINHO" in texto
-        )
-
-    if loteria == "MINAS-MG":
-        return (
-            "MINAS" in texto
-            or " MG " in f" {texto} "
-            or texto.startswith("MG ")
-        )
-
-    return False
+    return loteria in NOVAS_LOTERIAS
 
 
 def extrair_resultados_nova_loteria(html, loteria, data_obj, url):
@@ -1737,6 +1735,8 @@ def extrair_resultados_nova_loteria(html, loteria, data_obj, url):
         if not nome or not valor:
             continue
 
+        # A Federal pode aparecer misturada nessas páginas.
+        # Nunca deve ser incorporada às novas loterias.
         if parece_federal(nome):
             continue
 
