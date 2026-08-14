@@ -169,14 +169,27 @@ PTSP15_TOTAL_DIAS = (
 # NOVA COLETA HISTÓRICA
 # AVAL-PE + CAMINHO-DA-SORTE + MINAS-MG
 # Período: 01/01/2025 a 14/08/2026
+#
+# Regras especiais:
+# AVAL-PE: origem 13 -> grava 12 | origem 16 -> grava 15
+# CAMINHO-DA-SORTE: origem 20 -> grava 19
+# MINAS-MG: aceita ALVORADA 12, MINAS DIA 15,
+#           MINAS NOITE 19 e PREFERIDA 21
+# Federal é sempre ignorada.
 # ==========================================================
 
 NOVAS_LOTERIAS = {
     "AVAL-PE": {
         "slug": "resultados-aval-pernambuco-do-dia-",
         "url_base": "https://www.resultadofacil.com.br/",
-        "horarios_origem": {"09", "11", "12", "14", "15", "17", "19"},
-        "normalizacao_horarios": {},
+        # No Dataset do Resultado Fácil:
+        # 12:45 aparece com horário efetivo 13:00
+        # 15:45 aparece com horário efetivo 16:00
+        "horarios_origem": {"09", "11", "13", "14", "16", "17", "19"},
+        "normalizacao_horarios": {
+            "13": "12",
+            "16": "15",
+        },
     },
     "CAMINHO-DA-SORTE": {
         "slug": "resultados-caminho-da-sorte-do-dia-",
