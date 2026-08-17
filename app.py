@@ -4746,6 +4746,740 @@ def teste_periodo():
     })
 
 
+# ==========================================================
+# COLETA HISTÓRICA COMPLEMENTAR - PT-SP 09H
+# PT-SP 09H -> PT-SP | 09
+#
+# Criada para recuperar o novo horário das 09h sem depender
+# do estado/auditoria da coleta histórica principal.
+# O período começa em 01/07/2026 para também auditar datas
+# imediatamente anteriores ao primeiro 09h localizado.
+# ==========================================================
+
+PTSP09_DATA_INICIAL = datetime(2026, 7, 1)
+PTSP09_DATA_FINAL = datetime(2026, 8, 17)
+PTSP09_URL_BASE = "https://www.resultadofacil.com.br/"
+
+ARQUIVO_PTSP09_ESTADO = DIRETORIO_DADOS / "ptsp09_estado.json"
+ARQUIVO_PTSP09_RESULTADOS = DIRETORIO_DADOS / "ptsp09_resultados.jsonl"
+ARQUIVO_PTSP09_AUDITORIA = DIRETORIO_DADOS / "ptsp09_auditoria.jsonl"
+ARQUIVO_PTSP09_EXCEL = DIRETORIO_DADOS / "ptsp_09h_2026.xlsx"
+
+PTSP09_LOCK = threading.Lock()
+PTSP09_THREAD = None
+
+PTSP09_TOTAL_DIAS = (
+    PTSP09_DATA_FINAL.date()
+    - PTSP09_DATA_INICIAL.date()
+).days + 1
+
+
+def ptsp09_estado_inicial():
+    return {
+        "status": "nao_iniciada",
+        "data_inicial": PTSP09_DATA_INICIAL.strftime("%d/%m/%Y"),
+        "data_final": PTSP09_DATA_FINAL.strftime("%d/%m/%Y"),
+        "data_atual": None,
+        "dias_processados": 0,
+        "resultados_coletados": 0,
+        "falhas": 0,
+        "progresso": 0.0,
+        "mensagem": "A coleta PT-SP 09h ainda não foi iniciada.",
+    }
+
+
+def salvar_estado_ptsp09(estado):
+    temporario = ARQUIVO_PTSP09_ESTADO.with_suffix(".tmp")
+
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(
+            estado,
+            arquivo,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(temporario, ARQUIVO_PTSP09_ESTADO)
+
+
+def carregar_estado_ptsp09():
+    if not ARQUIVO_PTSP09_ESTADO.exists():
+        estado = ptsp09_estado_inicial()
+        salvar_estado_ptsp09(estado)
+        return estado
+
+    try:
+        with open(
+            ARQUIVO_PTSP09_ESTADO,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            return json.load(arquivo)
+
+    except Exception:
+        logging.exception("Erro ao carregar estado PT-SP 09h.")
+        return ptsp09_estado_inicial()
+
+
+def carregar_datas_ptsp09_concluidas():
+    concluidas = set()
+
+    if not ARQUIVO_PTSP09_AUDITORIA.exists():
+        return concluidas
+
+    try:
+        with open(
+            ARQUIVO_PTSP09_AUDITORIA,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(linha)
+                except Exception:
+                    continue
+
+                if registro.get("status") not in {
+                    "ok",
+                    "nao_encontrado",
+                    "sem_ptsp09",
+                }:
+                    continue
+
+                data = registro.get("data", "")
+
+                if data:
+                    concluidas.add(data)
+
+    except Exception:
+        logging.exception("Erro ao carregar auditoria PT-SP 09h.")
+
+    return concluidas
+
+
+def carregar_chaves_ptsp09():
+    chaves = set()
+
+    if not ARQUIVO_PTSP09_RESULTADOS.exists():
+        return chaves
+
+    try:
+        with open(
+            ARQUIVO_PTSP09_RESULTADOS,
+            "r",
+            encoding="utf-8"
+        ) as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+
+                if not linha:
+                    continue
+
+                try:
+                    registro = json.loads(linha)
+                except Exception:
+                    continue
+
+                chaves.add(
+                    f"{registro.get('data', '')}|"
+                    f"{registro.get('loteria', '')}|"
+                    f"{registro.get('horario', '')}"
+                )
+
+    except Exception:
+        logging.exception("Erro ao carregar resultados PT-SP 09h.")
+
+    return chaves
+
+
+def montar_url_ptsp09(data_obj):
+    data_iso = data_obj.strftime("%Y-%m-%d")
+
+    return (
+        f"{PTSP09_URL_BASE}"
+        f"resultados-pt-sp-do-dia-"
+        f"{data_iso}"
+    )
+
+
+def nome_variavel_eh_ptsp09(nome):
+    """
+    Aceita apenas o bloco PT-SP/PTSP das 09h.
+    Federal e outras bancas são descartadas.
+    """
+    texto = normalizar_texto(nome).upper()
+
+    if "FEDERAL" in texto:
+        return False
+
+    if extrair_horario_variavel(nome) != "09":
+        return False
+
+    return (
+        "PTSP" in texto
+        or "PT SP" in texto
+        or "PT-SP" in texto
+        or "PTN SP" in texto
+    )
+
+
+def extrair_ptsp09_resultadofacil(html, data_obj, url):
+    estrutura = extrair_dataset_resultadofacil(html)
+    variaveis = estrutura.get("variaveis", [])
+
+    premios = {}
+    nomes_origem = []
+
+    for item in variaveis:
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
+
+        if not nome or not valor:
+            continue
+
+        if not nome_variavel_eh_ptsp09(nome):
+            continue
+
+        posicao = extrair_posicao_premio(nome)
+
+        if posicao is None:
+            continue
+
+        milhar = extrair_milhar_valor(valor)
+
+        if not milhar:
+            continue
+
+        premios[posicao] = milhar
+        nomes_origem.append(nome)
+
+    if not all(p in premios for p in range(1, 6)):
+        return None
+
+    lista = [
+        premios[1],
+        premios[2],
+        premios[3],
+        premios[4],
+        premios[5],
+    ]
+
+    m6, m7 = calcular_premios_6_7(lista)
+
+    return {
+        "data": data_obj.strftime("%d/%m/%Y"),
+        "loteria": "PT-SP",
+        "horario": "09",
+        "m1": premios[1],
+        "m2": premios[2],
+        "m3": premios[3],
+        "m4": premios[4],
+        "m5": premios[5],
+        "m6": m6,
+        "m7": m7,
+        "url": url,
+        "origem": "RESULTADO_FACIL_PTSP09",
+        "variaveis_origem": nomes_origem,
+    }
+
+
+def buscar_ptsp09_data(data_obj):
+    url = montar_url_ptsp09(data_obj)
+
+    try:
+        resp = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+        )
+
+    except Exception as e:
+        return {
+            "status": "erro_rede",
+            "resultado": None,
+            "url": url,
+            "erro": str(e),
+        }
+
+    if resp.status_code == 404:
+        return {
+            "status": "nao_encontrado",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code == 403:
+        return {
+            "status": "bloqueado_403",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    if resp.status_code != 200:
+        return {
+            "status": f"http_{resp.status_code}",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    resultado = extrair_ptsp09_resultadofacil(
+        resp.text,
+        data_obj,
+        url,
+    )
+
+    if resultado is None:
+        return {
+            "status": "sem_ptsp09",
+            "resultado": None,
+            "url": url,
+            "erro": "",
+        }
+
+    return {
+        "status": "ok",
+        "resultado": resultado,
+        "url": url,
+        "erro": "",
+    }
+
+
+def executar_coleta_ptsp09():
+    global PTSP09_THREAD
+
+    logging.info(
+        "Iniciando coleta histórica complementar PT-SP 09h."
+    )
+
+    datas_concluidas = carregar_datas_ptsp09_concluidas()
+    chaves_resultados = carregar_chaves_ptsp09()
+    estado = carregar_estado_ptsp09()
+
+    estado.update({
+        "status": "executando",
+        "data_atual": None,
+        "dias_processados": len(datas_concluidas),
+        "resultados_coletados": len(chaves_resultados),
+        "falhas": 0,
+        "progresso": round(
+            (len(datas_concluidas) / PTSP09_TOTAL_DIAS) * 100,
+            2
+        ),
+        "mensagem": "Coleta histórica PT-SP 09h em andamento.",
+    })
+
+    salvar_estado_ptsp09(estado)
+
+    data_atual = PTSP09_DATA_INICIAL
+
+    try:
+        while data_atual <= PTSP09_DATA_FINAL:
+            data_br = data_atual.strftime("%d/%m/%Y")
+
+            if data_br in datas_concluidas:
+                data_atual += timedelta(days=1)
+                continue
+
+            estado["data_atual"] = data_br
+            estado["mensagem"] = (
+                f"Consultando PT-SP 09h em {data_br}."
+            )
+            salvar_estado_ptsp09(estado)
+
+            retorno = buscar_ptsp09_data(data_atual)
+            status = retorno.get("status", "desconhecido")
+            resultado = retorno.get("resultado")
+            novo = 0
+
+            if status == "ok" and resultado:
+                chave = (
+                    f"{resultado['data']}|"
+                    f"{resultado['loteria']}|"
+                    f"{resultado['horario']}"
+                )
+
+                if chave not in chaves_resultados:
+                    adicionar_jsonl(
+                        ARQUIVO_PTSP09_RESULTADOS,
+                        resultado
+                    )
+                    chaves_resultados.add(chave)
+                    novo = 1
+
+            adicionar_jsonl(
+                ARQUIVO_PTSP09_AUDITORIA,
+                {
+                    "data": data_br,
+                    "loteria": "PT-SP",
+                    "horario": "09",
+                    "status": status,
+                    "quantidade": 1 if resultado else 0,
+                    "novos": novo,
+                    "url": retorno.get("url", ""),
+                    "erro": retorno.get("erro", ""),
+                    "processado_em": datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    ),
+                }
+            )
+
+            if status in {
+                "ok",
+                "nao_encontrado",
+                "sem_ptsp09",
+            }:
+                datas_concluidas.add(data_br)
+            else:
+                estado["falhas"] += 1
+
+            estado["dias_processados"] = len(datas_concluidas)
+            estado["resultados_coletados"] = len(chaves_resultados)
+            estado["progresso"] = round(
+                (len(datas_concluidas) / PTSP09_TOTAL_DIAS) * 100,
+                2
+            )
+
+            salvar_estado_ptsp09(estado)
+
+            time.sleep(0.8)
+            data_atual += timedelta(days=1)
+
+        estado.update({
+            "status": "concluida",
+            "data_atual": PTSP09_DATA_FINAL.strftime("%d/%m/%Y"),
+            "dias_processados": len(datas_concluidas),
+            "resultados_coletados": len(chaves_resultados),
+            "progresso": round(
+                (len(datas_concluidas) / PTSP09_TOTAL_DIAS) * 100,
+                2
+            ),
+            "mensagem": "Coleta histórica PT-SP 09h concluída.",
+        })
+
+        salvar_estado_ptsp09(estado)
+
+    except Exception as e:
+        logging.exception("Falha geral na coleta PT-SP 09h.")
+
+        estado.update({
+            "status": "erro",
+            "mensagem": str(e),
+        })
+
+        salvar_estado_ptsp09(estado)
+
+    finally:
+        with PTSP09_LOCK:
+            PTSP09_THREAD = None
+
+
+def gerar_excel_ptsp09():
+    resultados = carregar_jsonl(ARQUIVO_PTSP09_RESULTADOS)
+    auditoria = carregar_jsonl(ARQUIVO_PTSP09_AUDITORIA)
+
+    if not resultados:
+        raise ValueError(
+            "Nenhum resultado PT-SP 09h foi coletado."
+        )
+
+    resultados.sort(
+        key=lambda item: datetime.strptime(
+            item.get("data", "01/01/1900"),
+            "%d/%m/%Y"
+        )
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "PT-SP 09H"
+
+    ws.append([
+        "Data", "Loteria", "Horário",
+        "M1", "M2", "M3", "M4", "M5", "M6", "M7",
+        "Origem", "URL",
+    ])
+
+    for resultado in resultados:
+        ws.append([
+            resultado.get("data", ""),
+            resultado.get("loteria", "PT-SP"),
+            resultado.get("horario", "09"),
+            resultado.get("m1", ""),
+            resultado.get("m2", ""),
+            resultado.get("m3", ""),
+            resultado.get("m4", ""),
+            resultado.get("m5", ""),
+            resultado.get("m6", ""),
+            resultado.get("m7", ""),
+            resultado.get("origem", ""),
+            resultado.get("url", ""),
+        ])
+
+    for linha in range(2, ws.max_row + 1):
+        ws.cell(linha, 3).number_format = "@"
+
+        for coluna in range(4, 10):
+            celula = ws.cell(linha, coluna)
+            celula.value = str(celula.value).zfill(4)
+            celula.number_format = "@"
+
+        celula_m7 = ws.cell(linha, 10)
+        celula_m7.value = str(celula_m7.value).zfill(3)
+        celula_m7.number_format = "@"
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:L{ws.max_row}"
+
+    for col, largura in {
+        "A": 13, "B": 12, "C": 10,
+        "D": 9, "E": 9, "F": 9, "G": 9, "H": 9, "I": 9, "J": 9,
+        "K": 28, "L": 85,
+    }.items():
+        ws.column_dimensions[col].width = largura
+
+    ws_auditoria = wb.create_sheet("AUDITORIA")
+
+    ws_auditoria.append([
+        "Data", "Loteria", "Horário", "Status",
+        "Quantidade", "Novos", "URL", "Erro", "Processado em",
+    ])
+
+    for registro in auditoria:
+        ws_auditoria.append([
+            registro.get("data", ""),
+            registro.get("loteria", "PT-SP"),
+            registro.get("horario", "09"),
+            registro.get("status", ""),
+            registro.get("quantidade", 0),
+            registro.get("novos", 0),
+            registro.get("url", ""),
+            registro.get("erro", ""),
+            registro.get("processado_em", ""),
+        ])
+
+    ws_auditoria.freeze_panes = "A2"
+    ws_auditoria.auto_filter.ref = (
+        f"A1:I{ws_auditoria.max_row}"
+    )
+
+    wb.save(ARQUIVO_PTSP09_EXCEL)
+
+    return {
+        "resultados": len(resultados),
+        "auditoria": len(auditoria),
+        "arquivo": str(ARQUIVO_PTSP09_EXCEL),
+    }
+
+
+# ==========================================================
+# ROTAS PT-SP 09H
+# ==========================================================
+
+@app.route("/ptsp09/teste/<data_teste>")
+def teste_ptsp09(data_teste):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    retorno = buscar_ptsp09_data(data_obj)
+
+    return jsonify({
+        "ok": True,
+        "data_consulta": data_teste,
+        **retorno,
+    })
+
+
+@app.route("/ptsp09/debug/<data_teste>")
+def debug_ptsp09(data_teste):
+    try:
+        data_obj = datetime.strptime(
+            data_teste,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "erro": "Data inválida. Use YYYY-MM-DD.",
+        }), 400
+
+    url = montar_url_ptsp09(data_obj)
+
+    resp = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
+
+    estrutura = extrair_dataset_resultadofacil(
+        resp.text
+    )
+
+    candidatos = []
+
+    for item in estrutura.get("variaveis", []):
+        if not isinstance(item, dict):
+            continue
+
+        nome = obter_campo_item(item, ["name", "nome"])
+        valor = obter_campo_item(item, ["value", "valor"])
+        horario = extrair_horario_variavel(nome)
+        texto = normalizar_texto(nome).upper()
+
+        if (
+            horario != "09"
+            and "PTSP" not in texto
+            and "PT SP" not in texto
+        ):
+            continue
+
+        candidatos.append({
+            "nome": nome,
+            "valor": valor,
+            "horario": horario,
+            "posicao": extrair_posicao_premio(nome),
+            "federal": "FEDERAL" in texto,
+            "aceito_ptsp09": nome_variavel_eh_ptsp09(nome),
+        })
+
+    return jsonify({
+        "ok": True,
+        "status_http": resp.status_code,
+        "url": url,
+        "total_variaveis_dataset": len(
+            estrutura.get("variaveis", [])
+        ),
+        "candidatos": candidatos,
+    })
+
+
+@app.route("/ptsp09/status")
+def status_ptsp09():
+    estado = carregar_estado_ptsp09()
+
+    return jsonify({
+        "ok": True,
+        "disco": str(DIRETORIO_DADOS),
+        "total_dias_previstos": PTSP09_TOTAL_DIAS,
+        "estado": estado,
+        "arquivos": {
+            "estado": ARQUIVO_PTSP09_ESTADO.exists(),
+            "resultados": ARQUIVO_PTSP09_RESULTADOS.exists(),
+            "auditoria": ARQUIVO_PTSP09_AUDITORIA.exists(),
+            "excel": ARQUIVO_PTSP09_EXCEL.exists(),
+        },
+    })
+
+
+@app.route("/ptsp09/iniciar")
+def iniciar_ptsp09():
+    global PTSP09_THREAD
+
+    with PTSP09_LOCK:
+        if (
+            PTSP09_THREAD is not None
+            and PTSP09_THREAD.is_alive()
+        ):
+            return jsonify({
+                "ok": False,
+                "mensagem": "A coleta PT-SP 09h já está em execução.",
+                "estado": carregar_estado_ptsp09(),
+            }), 409
+
+        PTSP09_THREAD = threading.Thread(
+            target=executar_coleta_ptsp09,
+            name="coleta_ptsp09",
+            daemon=True,
+        )
+
+        PTSP09_THREAD.start()
+
+    return jsonify({
+        "ok": True,
+        "mensagem": "Coleta histórica PT-SP 09h iniciada.",
+        "periodo": {
+            "inicio": PTSP09_DATA_INICIAL.strftime("%d/%m/%Y"),
+            "fim": PTSP09_DATA_FINAL.strftime("%d/%m/%Y"),
+        },
+        "total_dias": PTSP09_TOTAL_DIAS,
+        "status_url": "/ptsp09/status",
+    })
+
+
+@app.route("/ptsp09/gerar-excel")
+def rota_gerar_excel_ptsp09():
+    estado = carregar_estado_ptsp09()
+
+    if estado.get("status") != "concluida":
+        return jsonify({
+            "ok": False,
+            "mensagem": "A coleta PT-SP 09h ainda não foi concluída.",
+            "estado": estado,
+        }), 409
+
+    try:
+        resumo = gerar_excel_ptsp09()
+
+        return jsonify({
+            "ok": True,
+            "mensagem": "Planilha PT-SP 09h gerada com sucesso.",
+            **resumo,
+            "download": "/ptsp09/baixar",
+        })
+
+    except Exception as e:
+        logging.exception(
+            "Erro ao gerar Excel PT-SP 09h."
+        )
+
+        return jsonify({
+            "ok": False,
+            "erro": str(e),
+        }), 500
+
+
+@app.route("/ptsp09/baixar")
+def baixar_excel_ptsp09():
+    if not ARQUIVO_PTSP09_EXCEL.exists():
+        return jsonify({
+            "ok": False,
+            "mensagem": (
+                "A planilha PT-SP 09h ainda não foi gerada. "
+                "Acesse /ptsp09/gerar-excel primeiro."
+            ),
+        }), 404
+
+    return send_file(
+        ARQUIVO_PTSP09_EXCEL,
+        as_attachment=True,
+        download_name=(
+            "ptsp_09h_01-07-2026_a_17-08-2026.xlsx"
+        ),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+
+
 if __name__ == "__main__":
     porta = int(
         os.environ.get(
